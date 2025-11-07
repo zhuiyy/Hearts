@@ -5,7 +5,7 @@ Author: Zhuiy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import copy
+from typing import List, Tuple, Optional, Callable, Union
 import numpy as np
 import pandas as pd
 import os, sys
@@ -19,10 +19,15 @@ from game import Game, Card, Suit
 from Zhuiy_sample.Zhuiy_sample_policy import sample_policy
 
 
-def data_save(data, name):
-    pd.DataFrame(data).to_csv(data_path +'/' + name + '.csv', index=False)
+def data_save(data: List[float], name: str, append: bool=False) -> None:
+    df = pd.DataFrame(data)
+    path = data_path + '/' + name + '.csv'
+    if append and os.path.exists(path):
+        df.to_csv(path, mode='a', header=False, index=False)
+    else:
+        df.to_csv(path, index=False)
 
-def info_to_tensor(info) -> np.ndarray:
+def info_to_tensor(info: dict) -> np.ndarray:
     hand_array = np.zeros(52, dtype=np.float32)
     table_array = np.zeros(52, dtype=np.float32)
     current_table_array = np.zeros(52, dtype=np.float32)
@@ -55,55 +60,56 @@ def info_to_tensor(info) -> np.ndarray:
     
     return state_array
 
-def actions_to_mask(actions) -> np.ndarray:
+def actions_to_mask(actions: List[Card]) -> np.ndarray:
     mask_array = np.zeros(52, dtype=np.bool_)
     if actions:
         action_indices = [(card.suit.value * 13 + card.rank - 1) for card in actions]
         mask_array[action_indices] = True
     return mask_array
 
-def actions_to_tensor(actions) -> np.ndarray:
+def actions_to_tensor(actions: List[Card]) -> np.ndarray:
     action_array = np.zeros(52, dtype=np.float32)
     if actions:
         action_indices = [(card.suit.value * 13 + card.rank - 1) for card in actions]
         action_array[action_indices] = 1
     return action_array
 
-def action_to_card(action) -> Card:
+def action_to_card(action: int) -> Card:
     suit = action // 13
     rank = action % 13 + 1
     return Card(Suit(suit), rank)
 
-def card_to_action(card) -> int:
+def card_to_action(card: Card) -> int:
     return card.suit * 13 + card.rank - 1
 
 class Value_net(nn.Module):
-    def __init__(self, state_dim, hidden_dim, device):
+    def __init__(self, state_dim: int, hidden_dim: int, device: Union[str, torch.device]):
         super(Value_net, self).__init__()
         self.fc1 = nn.Linear(state_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, 1)
         self.to(device)
     
-    def forward(self, state):
+    def forward(self, state: torch.Tensor) -> torch.Tensor:
         return self.fc2(F.relu(self.fc1(state)))
 
 class Policy_net(nn.Module):
-    def __init__(self, state_dim, hidden_dim1, hidden_dim2,  action_dim, device):
+    def __init__(self, state_dim: int, hidden_dim1: int, hidden_dim2: int,  action_dim: int, device: Union[str, torch.device]):
         super(Policy_net, self).__init__()
         self.fc1 = nn.Linear(state_dim, hidden_dim1)
         self.fc2 = nn.Linear(hidden_dim1, hidden_dim2)
         self.fc3 = nn.Linear(hidden_dim2, action_dim)
         self.to(device)
-    def forward(self, state):
+    def forward(self, state: torch.Tensor) -> torch.Tensor:
         return F.softmax(self.fc3(F.relu(self.fc2(F.relu(self.fc1(state))))), dim=-1)
     
 class RF:
-    def __init__(self, state_dim, hidden_dim1, hidden_dim2, action_dim, lr, gamma, device):
+    def __init__(self, state_dim: int, hidden_dim1: int, hidden_dim2: int, action_dim: int, lr: float, gamma: float, device: Union[str, torch.device]):
         self.training_policy_net = Policy_net(state_dim, hidden_dim1, hidden_dim2, action_dim, device)
         self.value_net = Value_net(state_dim, (hidden_dim1 + hidden_dim2) // 2, device)
         self.gamma = gamma
         self.device = device
         self.lr = lr
+        self.total_episodes = 0
         self.transition_dict = {
             'states': [],
             'actions': [],
@@ -113,13 +119,32 @@ class RF:
         self.log = []
         self.loss_log = []
         self.p_optimizer = torch.optim.Adam(self.training_policy_net.parameters(), lr=self.lr)
-        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.p_optimizer, mode='min', factor=0.98, patience=10, 
-                              verbose=True, threshold=0.0001, threshold_mode='abs',
-                              cooldown=5, min_lr=1e-10)
-        self.v_optimizer = torch.optim.Adam(self.value_net.parameters(), lr=self.lr * 10)
+        # Reduce ValueNet LR significantly for high-variance environment
+        self.v_optimizer = torch.optim.Adam(self.value_net.parameters(), lr=self.lr)
         self.action_log_probs = []
+        self.entropy_terms = []
 
-    def take_action(self, state, mask=None) -> int:
+    # -------- Curriculum helpers --------
+    @staticmethod
+    def linear_curriculum(start_ratio: float, end_ratio: float, start_episode: int, end_episode: int):
+        """
+        Returns a function f(ep) -> ratio in [0,1].
+        - ep < start_episode: ratio = start_ratio
+        - ep > end_episode: ratio = end_ratio
+        - else: linear interpolation between start_ratio and end_ratio
+        Typical use: slowly increase probability of unmasked training episodes.
+        """
+        def schedule(ep: int) -> float:
+            if ep <= start_episode:
+                return max(0.0, min(1.0, start_ratio))
+            if ep >= end_episode:
+                return max(0.0, min(1.0, end_ratio))
+            t = (ep - start_episode) / max(1, (end_episode - start_episode))
+            val = start_ratio + t * (end_ratio - start_ratio)
+            return max(0.0, min(1.0, val))
+        return schedule
+
+    def take_action_with_mask(self, state: Union[np.ndarray, torch.Tensor], mask: Optional[Union[np.ndarray, torch.Tensor]]=None) -> Tuple[int, torch.Tensor]:
         if isinstance(state, np.ndarray):
             state = torch.from_numpy(state).float().to(self.device)
         elif not isinstance(state, torch.Tensor):
@@ -132,143 +157,232 @@ class RF:
                 mask = torch.tensor(mask, dtype=torch.bool).to(self.device)
     
         probs = self.training_policy_net(state)
-        action_dist_raw = torch.distributions.Categorical(probs)
         if mask is not None:
             probs = probs.masked_fill(~mask, 0)
         if probs.sum() > 0:
             probs = probs / probs.sum()
         else:
-            probs = mask.float() / mask.float().sum()
+            probs = mask.float() / (mask.float().sum() + 1e-8)
         
         action_dist = torch.distributions.Categorical(probs)
         action = action_dist.sample()
-
+        log_prob = action_dist.log_prob(action)
+        # Store entropy term for regularization
+        self.entropy_terms.append(action_dist.entropy())
         
-        log_prob = action_dist_raw.log_prob(action)
+        return action.item(), log_prob
+    
+    def take_action_without_mask(self, state: Union[np.ndarray, torch.Tensor], mask: Optional[Union[np.ndarray, torch.Tensor]]=None) -> Tuple[int, torch.Tensor]:
+        if isinstance(state, np.ndarray):
+            state = torch.from_numpy(state).float().to(self.device)
+        elif not isinstance(state, torch.Tensor):
+            state = torch.tensor(state, dtype=torch.float).to(self.device)
+        
+        if mask is not None:
+            if isinstance(mask, np.ndarray):
+                mask = torch.from_numpy(mask).to(self.device)
+            elif not isinstance(mask, torch.Tensor):
+                mask = torch.tensor(mask, dtype=torch.bool).to(self.device)
+    
+        probs = self.training_policy_net(state)
+        
+        action_dist = torch.distributions.Categorical(probs)
+        action = action_dist.sample()
+        
+        log_prob = action_dist.log_prob(action)
+        # Store entropy term for regularization
+        self.entropy_terms.append(action_dist.entropy())
         
         return action.item(), log_prob
 
-    def reward_design(self, ai_score_delta, ai_actions, ai_info, shot) -> list[int]:
-        if not shot:
-            reward = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
-            for i in range(13):
+
+    def reward_design(self, ai_score_delta: List[int], ai_actions: List[int], ai_info: List[np.ndarray], shot: Optional[bool]) -> List[int]:
+        num_rounds = len(ai_score_delta)
+        if shot is None:
+            reward = [0] * num_rounds
+            reward[-1] = -100
+            return reward
+        
+        if shot is False:
+            reward = [0] * num_rounds
+            for i in range(num_rounds):
                 reward[i] -= ai_score_delta[i] * 3
-                if ai_actions[i] == 50:
+                if ai_actions[i] == 50: # SPADES Queen
                     if ai_score_delta[i] > 0:
                         reward[i] -= 20
                     else:
                         reward[i] += 10
-                if ai_actions[i] < 13:
+                if ai_actions[i] < 13: # HEARTS
                     if ai_score_delta[i] > 0:
                         reward[i] -= 5
                     else:
                         reward[i] += 10
-        else:
-            reward = [5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5]
-            for i in range(13):
+        else: # shot the moon
+            reward = [5] * num_rounds
+            for i in range(num_rounds):
                 reward[i] += ai_score_delta[i]
         return reward
 
-    def update(self, ai_score_delta, ai_actions, ai_log_probs, ai_info, shot):
-        states = np.stack(ai_info)
-        states = torch.from_numpy(states).float().to(self.device)
+    def update(self, ai_score_delta: List[int], ai_actions: List[int], ai_log_probs: List[torch.Tensor], ai_info: List[np.ndarray], shot: Optional[bool]) -> Tuple[float, float]:
+        states_np = np.stack(ai_info)
+        states = torch.from_numpy(states_np).float().to(self.device)
 
-        actions = np.array(ai_actions)
-        actions = torch.from_numpy(actions).long().view(-1, 1).to(self.device)
+        rewards_np = np.array(self.reward_design(ai_score_delta, ai_actions, ai_info, shot), dtype=np.float32)
+        rewards = torch.from_numpy(rewards_np).float().view(-1, 1).to(self.device)
 
-        rewards = np.array(self.reward_design(ai_score_delta, ai_actions, ai_info, shot))
-        rewards = torch.from_numpy(rewards).float().view(-1, 1).to(self.device)
+        log_probs_full = torch.stack(ai_log_probs).view(-1, 1).to(self.device)
+        entropy_full = torch.stack(self.entropy_terms).view(-1, 1).to(self.device) if len(self.entropy_terms) == len(ai_log_probs) else None
 
+        if shot is None:
+            # Only use the final timestep when an illegal move occurred
+            states = states[-1:]
+            rewards = rewards[-1:]
+            log_probs_full = log_probs_full[-1:]
+            if entropy_full is not None:
+                entropy_full = entropy_full[-1:]
+
+        # Value prediction for the selected timesteps
         value_predicted = self.value_net(states).float().view(-1, 1).to(self.device)
 
-        log_probs = torch.stack(ai_log_probs).view(-1, 1).to(self.device)
-
+        # Compute returns with normalization
         returns = []
-        G = 0
+        G = torch.zeros(1, device=self.device)
         for r in reversed(rewards):
             G = r + self.gamma * G
             returns.insert(0, G)
         returns = torch.cat(returns).view(-1, 1)
-
-        advantages = returns - value_predicted.detach()
-        if len(advantages) > 1:
+        
+        # Normalize returns to stabilize value learning
+        if shot is not None and returns.numel() > 1:
+            returns = (returns - returns.mean()) / (returns.std() + 1e-6)
+        
+        # Advantages
+        advantages = (returns - value_predicted.detach())
+        if shot is not None and advantages.numel() > 1:
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-6)
 
-
+        # Policy update with stronger entropy regularization
         self.p_optimizer.zero_grad()
-        # L_policy = -E[logπ(a|s) * A(s,a)]
-        policy_loss = -(log_probs * advantages).mean()
+        ent_coef = 0.05  # Increased to encourage more exploration
+        if entropy_full is not None:
+            policy_loss = -(log_probs_full * advantages).mean() - ent_coef * entropy_full.mean()
+        else:
+            policy_loss = -(log_probs_full * advantages).mean()
         policy_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.training_policy_net.parameters(), 0.5)
         self.p_optimizer.step()
 
-
+        # Value update with stronger gradient clipping
         self.v_optimizer.zero_grad()
-        # L_value = (V(s) - G_t)^2
         value_loss = F.mse_loss(value_predicted, returns)
         value_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.value_net.parameters(), 0.5)
         self.v_optimizer.step()
 
         return policy_loss.item(), value_loss.item()
     
-    def save(self, path1, path2):
-        torch.save(self.training_policy_net.state_dict(), path1)
-        torch.save(self.value_net.state_dict(), path2)
+    def save(self, path: str) -> None:
+        torch.save({
+            'policy_net_state_dict': self.training_policy_net.state_dict(),
+            'value_net_state_dict': self.value_net.state_dict(),
+            'p_optimizer_state_dict': self.p_optimizer.state_dict(),
+            'v_optimizer_state_dict': self.v_optimizer.state_dict(),
+            'total_episodes': self.total_episodes
+        }, path)
 
-    def load(self, path1, path2):
-        self.training_policy_net.load_state_dict(torch.load(path1))
-        self.value_net.load_state_dict(torch.load(path2))
+    def load(self, path: str) -> None:
+        checkpoint = torch.load(path)
+        self.training_policy_net.load_state_dict(checkpoint['policy_net_state_dict'])
+        self.value_net.load_state_dict(checkpoint['value_net_state_dict'])
+        self.p_optimizer.load_state_dict(checkpoint['p_optimizer_state_dict'])
+        self.v_optimizer.load_state_dict(checkpoint['v_optimizer_state_dict'])
+        self.total_episodes = checkpoint.get('total_episodes', 0)
     
-    def training_policy(self, player, player_info, actions, order) -> Card:
-        a, b = self.take_action(info_to_tensor(player_info), actions_to_mask(actions))
+    def training_policy(self, player, player_info: dict, actions: List[Card], order: int) -> Card:
+        a, b = self.take_action_with_mask(info_to_tensor(player_info), actions_to_mask(actions))
+        self.action_log_probs.append(b)
+        return action_to_card(a)
+
+    def training_policy_unmasked(self, player, player_info: dict, actions: List[Card], order: int) -> Card:
+        # Occasionally used for curriculum: allow sampling without mask
+        a, b = self.take_action_without_mask(info_to_tensor(player_info))
         self.action_log_probs.append(b)
         return action_to_card(a)
     
-    def policy(self, player, player_info, actions, order) -> Card:
-        a, b = self.take_action(info_to_tensor(player_info), actions_to_mask(actions))
+    def policy(self, player, player_info: dict, actions: List[Card], order: int) -> Card:
+        a, b = self.take_action_with_mask(info_to_tensor(player_info), actions_to_mask(actions))
         return action_to_card(a)
+
+    def showcase_policy(self, player, player_info: dict, actions: List[Card], order: int) -> Card:
+        # Unmasked sampling to check rule-following behavior
+        chosen_action_idx, _ = self.take_action_without_mask(info_to_tensor(player_info))
+        chosen_card = action_to_card(chosen_action_idx)
+
+        legal_actions = actions
+        if chosen_card not in legal_actions:
+            print(f"--- [Showcase] AI player {player.player_id} attempted an illegal play: {chosen_card} ---")
+            print(f"--- Legal actions: {legal_actions} ---")
+        
+        return chosen_card
     
-    def train(self, game: Game, oppo_policy, episodes):
+    def train(self, game: Game, oppo_policy: List[Callable], episodes: int, append_log: bool=False, curriculum: Optional[Callable]=None) -> None:
         p_loss = []
         v_loss = []
         points = []
-        e_1 = episodes // 4
-        e_2 = episodes - e_1
-        for i in tqdm(range(e_1)):
+        
+        for i in tqdm(range(episodes)):
             self.action_log_probs = []
-            score, shot, ai_score_delta, ai_actions, ai_masks, ai_info = game.fight([self.training_policy] + oppo_policy, True, False, False)
-            ai_actions = np.array([card_to_action(action) for action in ai_actions])
-            ai_masks = np.array([actions_to_mask(mask) for mask in ai_masks])
-            ai_info = np.array([info_to_tensor(info) for info in ai_info])
-            p, v = self.update(ai_score_delta, ai_actions, self.action_log_probs, ai_info, shot)
-            p_loss.append(p)
-            v_loss.append(v)
-            points.append(score[0])
-        for i in tqdm(range(e_2)):
-            self.action_log_probs = []
-            score, shot, ai_score_delta, ai_actions, ai_masks, ai_info = game.fight([self.training_policy] + [random.choice(oppo_policy + [self.policy]), random.choice(oppo_policy + [self.policy]), random.choice(oppo_policy + [self.policy])], True, False, False)
-            ai_actions = np.array([card_to_action(action) for action in ai_actions])
-            ai_masks = np.array([actions_to_mask(mask) for mask in ai_masks])
-            ai_info = np.array([info_to_tensor(info) for info in ai_info])
-            p, v = self.update(ai_score_delta, ai_actions, self.action_log_probs, ai_info, shot)
-            p_loss.append(p)
-            v_loss.append(v)
-            points.append(score[0])
-        self.save(data_path + '/policy_net', data_path+'/value_net')
-        data_save(p_loss, 'p_loss')
-        data_save(v_loss, 'v_loss')
-        data_save(points, 'score')
-        print(f'training finished after {episodes} episodes, mean_score: {sum(points) / episodes}, mean_p_loss: {sum(p_loss) / episodes}, mean_v_loss: {sum(v_loss) / episodes}')
+            self.entropy_terms = []
+            # Decide whether to use an unmasked episode for the learning agent, based on curriculum
+            ep_index = self.total_episodes + i
+            ratio = 0.0
+            if callable(curriculum):
+                try:
+                    ratio = float(curriculum(ep_index))
+                except TypeError:
+                    # For backward compatibility: curriculum(ep_index, episodes)
+                    ratio = float(curriculum(ep_index, episodes))
+            ratio = max(0.0, min(1.0, ratio))
+            use_unmasked = (random.random() < ratio)
 
-    def evaluation(self, game: Game, oppo_policy, episodes):
+            learner_policy = self.training_policy_unmasked if use_unmasked else self.training_policy
+
+            score, shot, ai_score_delta, ai_actions, ai_masks, ai_info = game.fight([learner_policy] + oppo_policy, True, False, False)
+            ai_actions = np.array([card_to_action(action) for action in ai_actions])
+            ai_masks = np.array([actions_to_mask(mask) for mask in ai_masks])
+            ai_info = np.array([info_to_tensor(info) for info in ai_info])
+
+            p, v = self.update(ai_score_delta, ai_actions, self.action_log_probs, ai_info, shot)
+            p_loss.append(p)
+            v_loss.append(v)
+            points.append(score[0])
+        
+        self.total_episodes += episodes
+        self.save(data_path + '/model_checkpoint.pth')
+        data_save(p_loss, 'p_loss', append=append_log)
+        data_save(v_loss, 'v_loss', append=append_log)
+        data_save(points, 'score', append=append_log)
+        print(f'Training finished. total_episodes: {self.total_episodes}, mean_score: {sum(points) / episodes}, mean_p_loss: {sum(p_loss) / episodes}, mean_v_loss: {sum(v_loss) / episodes}')
+
+    def evaluation(self, game: Game, oppo_policy: List[Callable], episodes: int) -> None:
         s = np.array([0, 0, 0, 0])
-        print('evaluating')
+        print('Evaluating')
         for i in tqdm(range(episodes)):
             score, a, b, c, d, e = game.fight([self.policy] + oppo_policy, True, False, False)
             s += score
         print(s / episodes)
 
+    def showcase_games(self, game: Game, oppo_policy: List[Callable], episodes: int=3) -> None:
+        print("\n--- Show 3 games ---")
+        for i in range(episodes):
+            print(f"\n--- Game {i+1} ---")
+            score, _, _, _, _, _ = game.fight([self.showcase_policy] + oppo_policy, training=True, verbose=True, human_0=False)
+            print(f"--- Game {i+1} finished, final score: {score} ---")
+
 if __name__ == '__main__':
-    model = RF(163, 128, 64, 52, 1e-3, 0.98, 'cuda')
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    # Reduce learning rate for more stable training
+    model = RF(163, 128, 64, 52, 5e-4, 0.98, device)
     Hearts = Game()
 
     while True:
@@ -281,21 +395,38 @@ if __name__ == '__main__':
         if to_load in ['y', 'n']:
             break
     
+    model_path = data_path + '/model_checkpoint.pth'
+
     if to_train == 'n':
         if to_load == 'y':
-            model.load(data_path + '/policy_net', data_path + '/value_net')
-            model.evaluation(Hearts, [sample_policy, sample_policy, sample_policy], 300)
+            if os.path.exists(model_path):
+                model.load(model_path)
+                print(f"Model loaded. Trained episodes: {model.total_episodes}.")
+                model.showcase_games(Hearts, [sample_policy, sample_policy, sample_policy])
+            else:
+                print(f"Model file not found: {model_path}. Unable to evaluate.")
+                exit(0)
         else:
-            print('kicking you off')
+            print('Kicking you off')
             time.sleep(2)
             exit(0)
-    else:
-        mirror_model = copy.deepcopy(model)
+    else: # to_train == 'y'
+        append_log = False
         if to_load == 'y':
-            model.load(data_path + '/policy_net', data_path + '/value_net')
-            model.train(Hearts, [sample_policy, sample_policy, sample_policy], 350)
-            model.evaluation(Hearts, [sample_policy, sample_policy, sample_policy], 300)
-        else:
-            model.train(Hearts, [sample_policy, sample_policy, sample_policy], 350)
-            model.evaluation(Hearts, [sample_policy, sample_policy, sample_policy], 300)
-    
+            if os.path.exists(model_path):
+                model.load(model_path)
+                print(f"Loaded model: {model_path}. Continue training. Trained episodes: {model.total_episodes}.")
+                append_log = True
+                model.train(Hearts, [sample_policy, sample_policy, sample_policy], 300, append_log=append_log)
+                model.showcase_games(Hearts, [sample_policy, sample_policy, sample_policy])
+            else:
+                print(f"Model file not found: {model_path}. Training from scratch.")
+                model.train(Hearts, [sample_policy, sample_policy, sample_policy], 300, append_log=False)
+                model.showcase_games(Hearts, [sample_policy, sample_policy, sample_policy])
+        else: # to_load == 'n'
+            print("Training from scratch.")
+            for log_file in ['p_loss.csv', 'v_loss.csv', 'score.csv']:
+                if os.path.exists(data_path + '/' + log_file):
+                    os.remove(data_path + '/' + log_file)
+            model.train(Hearts, [sample_policy, sample_policy, sample_policy], 300, append_log=False)
+            model.showcase_games(Hearts, [sample_policy, sample_policy, sample_policy])

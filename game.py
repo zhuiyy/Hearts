@@ -28,13 +28,14 @@ class Card:
 
 @dataclass
 class Player:
+    player_id: int
     hand: List[Card] = field(default_factory=list)
     points: int = 0
     table: List[Card] = field(default_factory=list)
 
 @dataclass
 class GameState:
-    players: List[Player] = field(default_factory=lambda: [Player() for _ in range(4)])
+    players: List[Player] = field(default_factory=lambda: [Player(player_id=i) for i in range(4)])
     deck: List[Card] = field(default_factory=list)
     table: List[Tuple[Card, int]] = field(default_factory=list)
     current_table: List[Tuple[Card, int]] = field(default_factory=list)
@@ -164,6 +165,8 @@ class Game:
             if card.suit == Suit.HEARTS and not self.gamestate.hearts_broken:
                 self.gamestate.hearts_broken = True
             if card not in actions:
+                print(f'player{player_idx} was caught cheating!')
+                print('you su...')
                 raise ValueError(f'player {player_idx} played invalid card {card}, available actions: {actions}')
             player.hand.remove(card)
             player.table.append(card)
@@ -183,9 +186,17 @@ class Game:
         print()
         return winner_idx
 
-    def play_round_training(self, first_player: int, policies: List[Callable]) -> tuple[int, int, Card, List[Card]]:
+    def play_round_training(self, first_player: int, policies: List[Callable], verbose: bool=False) -> tuple[int, int, Card, List[Card]]:
         self.gamestate.current_table = []
         self.gamestate.current_suit = None
+        if verbose:
+            print(f'round {self.rounds}:')
+            print()
+            for i, player in enumerate(self.gamestate.players):
+                print(f'player {i} hand:', sorted(player.hand))
+            print()
+            print('current points:', [p.points for p in self.gamestate.players])
+            print()
         table: List[(Card, int)] = []
         scored = any(p.points > 0 for p in self.gamestate.players)
         for i in range(4):
@@ -196,18 +207,26 @@ class Game:
             actions = available_actions(player, self.gamestate.current_suit, is_first, scored)
             if player_idx == 0:
                 ai_actions = actions
+            
+            if verbose:
+                print(f'player {player_idx}\'s avilable actions: {sorted(actions)}')
 
             card = policies[player_idx](player, self.get_info(player_idx), actions, i)
             if player_idx == 0:
                 ai_action = card
             
+            if verbose:
+                print(f'player {player_idx} plays {card}')
+
             if not self.gamestate.piggy_pulled and (card.suit == Suit.SPADES and card.rank == 12):
                 self.gamestate.piggy_pulled = True
                 self.gamestate.hearts_broken = True
             if card.suit == Suit.HEARTS and not self.gamestate.hearts_broken:
                 self.gamestate.hearts_broken = True
             if card not in actions:
-                raise ValueError(f'player {player_idx} played invalid card {card}, available actions: {actions}')
+                # 玩家出了非法牌，返回一个惩罚信号
+                # winner_idx=None, ai_score=-100
+                return None, 100, ai_action, ai_actions
             player.hand.remove(card)
             player.table.append(card)
             table.append((card, player_idx))
@@ -223,6 +242,10 @@ class Game:
         if winner_idx == 0:
             ai_score = value
         self.gamestate.players[winner_idx].points += value
+        if verbose:
+            print(f'player {winner_idx} wins the round and gets {value} points')
+            print('-----------------------------------')
+            print()
         return winner_idx, ai_score, ai_action, ai_actions
 
     def play_round_human_0(self, first_player: int, policies: List[Callable]) -> int:
@@ -248,7 +271,9 @@ class Game:
             if card.suit == Suit.HEARTS and not self.gamestate.hearts_broken:
                 self.gamestate.hearts_broken = True
             if card not in actions:
-                raise ValueError(f'player {player_idx} played invalid card {card}, available actions: {actions}')
+                print(f'player{player_idx} was caught cheating!')
+                print('move your ass out of here')
+                raise ValueError(f'{player_idx} played invalid card {card}, available actions: {actions}')
             player.hand.remove(card)
             player.table.append(card)
             table.append((card, player_idx))
@@ -282,7 +307,7 @@ class Game:
         print(f'error: {text}')
         return [p.points for p in self.gamestate.players]
 
-    def fight(self, policies: List[Callable], training: bool=False, human_0: bool=False, trick=False) -> Union[List[int], tuple[List[int], bool, List[int], List[Card], List[List[Card]], List[dict]], None]:
+    def fight(self, policies: List[Callable], training: bool=False, human_0: bool=False, trick=False, verbose: bool=False) -> Union[List[int], tuple[List[int], bool, List[int], List[Card], List[List[Card]], List[dict]], None]:
         self.reset(trick)
         #try:
         first_player = self.gamestate.get_first_player()
@@ -293,10 +318,14 @@ class Game:
             ai_info = []
             while self.rounds <= 13:
                 ai_info.append(self.get_info(0))
-                first_player, a_s_d, a_a, a_m = self.play_round_training(first_player, policies)
-                ai_score_delta.append(a_s_d)
+                first_player, a_s_d, a_a, a_m = self.play_round_training(first_player, policies, verbose)
                 ai_actions.append(a_a)
                 ai_masks.append(a_m)
+                ai_score_delta.append(a_s_d)
+                if first_player is None:
+                    # 非法操作，游戏提前结束
+                    # 返回当前得分，shot=False，以及到目前为止的记录
+                    return [p.points for p in self.gamestate.players], None, ai_score_delta, ai_actions, ai_masks, ai_info
                 self.rounds += 1
             score, shot = self.end_game()
             #print('final points:', score)
