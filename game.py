@@ -1,366 +1,480 @@
-'''
-authour : Zhuiy
-'''
+"""
+Hearts Game Logic - Refactored Version
+Focuses on Training and Showcase modes, removing human interaction.
+"""
 
-from dataclasses import dataclass, field
-from enum import IntEnum
 import random
-from typing import List, Callable, Optional, Tuple, Union
+from typing import List, Callable, Optional, Tuple, Dict, Any
+from data_structure import Suit, Card, Player, GameState, TrickRecord, PlayEvent, PassDirection, PassEvent
 
-class Suit(IntEnum):
-    HEARTS = 0
-    DIAMONDS = 1
-    CLUBS = 2
-    SPADES = 3
-
-@dataclass(frozen=True)
-class Card:
-    suit: Suit
-    rank: int  # 1-13
-    def __repr__(self):
-        suit_symbols = {Suit.HEARTS: 'H', Suit.DIAMONDS: 'D', Suit.CLUBS: 'C', Suit.SPADES: 'S'}
-        return f"{suit_symbols[self.suit]}{self.rank}"
-    
-    def __lt__(self, other):
-        if self.suit == other.suit:
-            return self.rank < other.rank
-        return self.suit < other.suit
-
-@dataclass
-class Player:
-    player_id: int
-    hand: List[Card] = field(default_factory=list)
-    points: int = 0
-    table: List[Card] = field(default_factory=list)
-
-@dataclass
-class GameState:
-    players: List[Player] = field(default_factory=lambda: [Player(player_id=i) for i in range(4)])
-    deck: List[Card] = field(default_factory=list)
-    table: List[Tuple[Card, int]] = field(default_factory=list)
-    current_table: List[Tuple[Card, int]] = field(default_factory=list)
-    current_suit: Suit = None
-    hearts_broken: bool = False
-    piggy_pulled: bool = False
-
-    def reset(self):
-        current_suits = None
-        hearts_broken = False
-        piggy_pulled = False
-        self.deck = [Card(suit, rank) for suit in Suit for rank in range(1, 14)]
-        random.shuffle(self.deck)
-        for player in self.players:
-            player.hand = []
-            player.points = 0
-            player.table = []
-        for i, card in enumerate(self.deck):
-            self.players[i % 4].hand.append(card)
-
-    def get_first_player(self) -> int:
-        for i, player in enumerate(self.players):
-            for card in player.hand:
-                if card.suit == Suit.CLUBS and card.rank == 2:
-                    return i
-
-def card_value(card: Card) -> int:
-    if card.suit == Suit.HEARTS:
-        return 1
-    elif card.suit == Suit.SPADES and card.rank == 12:
-        return 13
-    return 0
 
 def available_actions(player: Player, suit: Optional[Suit], is_first_round: bool, scored: bool) -> List[Card]:
     """
-    :param player: 当前玩家
-    :param suit: 本轮首出花色
-    :param is_first_round: 是否第一轮
-    :param scored: 是否已经有人得分（只要有一人分数>0）
+    Determine legal moves for a player.
+    
+    :param player: Current player
+    :param suit: Leading suit of the current trick (None if leading)
+    :param is_first_round: Whether this is the first trick of the game (2 of Clubs lead)
+    :param scored: Whether any points have been scored (hearts broken condition check usually, but here 'scored' implies points on table?)
+                   Actually in standard hearts, 'scored' usually refers to if hearts have been broken.
+                   Let's stick to the logic from the original file.
     """
+    hand = player.hand
     if is_first_round:
         if suit is None:
-            return [Card(Suit.CLUBS, 2)]
+            # Must lead 2 of Clubs if holding it (standard rule, usually enforced by game start)
+            # But if we are just checking general logic:
+            # In standard hearts, the player with 2C leads it.
+            # If this function is called for the leader of the first round, they MUST have 2C.
+            # If for some reason they don't (e.g. custom deal), we might need fallback.
+            # Assuming standard deal:
+            c2 = Card(Suit.CLUBS, 2)
+            if c2 in hand:
+                return [c2]
+            # If not holding 2C (shouldn't happen for leader), return all valid leads?
+            # Original code returned [2C] if suit is None.
+            return [c2] 
         else:
-            suited = [c for c in player.hand if c.suit == suit]
+            # Following in first round
+            suited = [c for c in hand if c.suit == suit]
             if suited:
                 return sorted(suited)
-            non_hearts = [c for c in player.hand if c.suit != Suit.HEARTS]
+            
+            # Cannot play points (Hearts or QS) on first trick usually
+            # Original code: non_hearts = [c for c in hand if c.suit != Suit.HEARTS]
+            # And filter out QS (Spades 12)
+            non_hearts = [c for c in hand if c.suit != Suit.HEARTS]
+            safe_cards = [c for c in non_hearts if not (c.suit == Suit.SPADES and c.rank == 12)]
+            
+            if not scored and safe_cards:
+                 return sorted(safe_cards)
+            
+            # If only have point cards, must play them (slough)
             if not scored and non_hearts:
-                return sorted([c for c in non_hearts if not (c.suit == Suit.SPADES and c.rank == 12)] or non_hearts)
-            return sorted(player.hand)
+                 return sorted(non_hearts)
+                 
+            return sorted(hand)
     else:
         if suit is None:
-            if not scored:
-                non_hearts = [c for c in player.hand if c.suit != Suit.HEARTS]
+            # Leading
+            if not scored: # "scored" here seems to map to "hearts broken" in original logic context?
+                # Original logic: if not scored, cannot lead Hearts
+                non_hearts = [c for c in hand if c.suit != Suit.HEARTS]
                 if non_hearts:
                     return sorted(non_hearts)
                 else:
-                    return sorted(player.hand)
+                    # Only have hearts, must lead hearts
+                    return sorted(hand)
             else:
-                return sorted(player.hand)
+                # Hearts broken, can lead anything
+                return sorted(hand)
         else:
-            suited = [c for c in player.hand if c.suit == suit]
+            # Following
+            suited = [c for c in hand if c.suit == suit]
             if suited:
                 return sorted(suited)
-            non_hearts = [c for c in player.hand if c.suit != Suit.HEARTS]
+            
+            # Sloughing
+            # Original logic:
+            # non_hearts = [c for c in hand if c.suit != Suit.HEARTS]
+            # if not scored and non_hearts: return sorted(non_hearts)
+            # return sorted(player.hand)
+            
+            # Wait, standard rules allow sloughing anything if void in suit.
+            # The restriction "if not scored" usually applies to breaking hearts?
+            # Or maybe "scored" means "points on table"?
+            # Let's stick to original logic to be safe.
+            non_hearts = [c for c in hand if c.suit != Suit.HEARTS]
             if not scored and non_hearts:
                 return sorted(non_hearts)
-            return sorted(player.hand)
-# availavle_actions are sorted
+            return sorted(hand)
 
-class Game:
-    def __init__(self):
+
+def card_value(card: Card) -> int:
+    return card.value()
+
+
+class GameV2:
+    def __init__(self) -> None:
         self.gamestate = GameState()
-        self.rounds = 1
+        self.rounds = 1 # Actually this tracks the trick number (1-13)
+        self.trick_history: List[TrickRecord] = []
+        self.pass_direction = PassDirection.KEEP
 
-    def player_info(self, player: int) -> dict:
+    def reset(self) -> None:
+        self.gamestate.reset()
+        self.rounds = 1
+        self.trick_history = []
+        self.pass_direction = PassDirection.KEEP
+
+    def get_game_info(self) -> Dict[str, Any]:
+        # Construct a dictionary similar to original game_info
+        # But we can use the GameState's method if available or build it here
+        # Original game_info returned: rounds, players (snapshot), scoreboard, deck, history, current_table...
+        
+        players_snapshot = []
+        for p in self.gamestate.players:
+            players_snapshot.append({
+                'player_id': p.player_id,
+                'hand': list(p.hand),
+                'points': p.points,
+                'taken_tricks': list(p.table) # p.table stores cards taken?
+            })
+
         return {
-            'hand': self.gamestate.players[player].hand,
-            'points': self.gamestate.players[player].points,
-            'table': self.gamestate.table,
-            'current_table': self.gamestate.current_table,
-            'current_suit': self.gamestate.current_suit,
-            'hearts_broken': self.gamestate.hearts_broken,
-            'piggy_pulled': self.gamestate.piggy_pulled,
             'rounds': self.rounds,
+            'players': players_snapshot,
+            'scoreboard': [p.points for p in self.gamestate.players],
+            'deck': list(self.gamestate.deck),
+            'history': list(self.gamestate.table), # All cards played in order?
+            'current_table': list(self.gamestate.current_table),
+            'current_suit': self.gamestate.current_suit,
+            'hearts_broken': self.gamestate.heart_broken,
+            'piggy_pulled': self.gamestate.piggy_pulled,
             'current_order': len(self.gamestate.current_table)
         }
 
-    def get_info(self, player: int) -> dict:
-        return self.player_info(player)
-
-    def reset(self, trick=False):
-        self.gamestate.reset()
-        self.rounds = 1
-        if trick:
-            # pull the pig into player_0's hand!
-            for i in range(4):
-                if Card(3, 12) in self.gamestate.players[i].hand:
-                    self.gamestate.players[i].hand.remove(Card(3, 12))
-                    self.gamestate.players[i].hand.append(self.gamestate.players[0].hand.pop())
-                    self.gamestate.players[0].hand.append(Card(3, 12))
+    def get_player_info(self, player_id: int) -> Dict[str, Any]:
+        # Similar to original player_info
+        p = self.gamestate.players[player_id]
+        
+        # Gather public stats for all players
+        players_stats = []
+        for pl in self.gamestate.players:
+            has_sq = False
+            for c in pl.table:
+                if c.suit == Suit.SPADES and c.rank == 12:
+                    has_sq = True
                     break
-                
-    def play_round(self, first_player: int, policies: List[Callable]) -> int:
-        self.gamestate.current_table = []
-        self.current_suit = None
-        print(f'round {self.rounds}:')
-        print()
+            players_stats.append({
+                'points': pl.points,
+                'has_sq': has_sq
+            })
+
+        return {
+            'player_id': p.player_id,
+            'hand': list(p.hand),
+            'points': p.points,
+            'taken_tricks': list(p.table),
+            'scoreboard': [pl.points for pl in self.gamestate.players],
+            'players_stats': players_stats, # New field
+            'table': list(self.gamestate.table),
+            'current_table': list(self.gamestate.current_table),
+            'current_suit': self.gamestate.current_suit,
+            'heart_broken': self.gamestate.heart_broken,
+            'piggy_pulled': self.gamestate.piggy_pulled,
+            'rounds': self.rounds,
+            'current_order': len(self.gamestate.current_table),
+            'pass_direction': self.pass_direction # New field
+        }
+
+    def perform_pass(self, pass_direction: PassDirection, pass_policies: List[Callable]) -> List[PassEvent]:
+        """
+        Execute the passing phase.
+        
+        :param pass_direction: Direction to pass cards.
+        :param pass_policies: List of 4 policy functions for passing. 
+                              Signature: (player, player_info) -> List[Card] (3 cards)
+        :return: List of PassEvent
+        """
+        if pass_direction == PassDirection.KEEP:
+            return []
+
+        pass_events = []
+        passed_cards_map = {} # player_id -> cards passed BY them
+
+        # 1. Select cards to pass
         for i, player in enumerate(self.gamestate.players):
-            print(f'player {i} hand:', sorted(player.hand))
-        print()
-        print('current points:', [p.points for p in self.gamestate.players])
-        print()
-        table: List[(Card, int)] = []
-        scored = any(p.points > 0 for p in self.gamestate.players)
+            p_info = self.get_player_info(i)
+            # Policy should return 3 cards to pass
+            cards_to_pass = pass_policies[i](player, p_info)
+            
+            if len(cards_to_pass) != 3:
+                raise ValueError(f"Player {i} selected {len(cards_to_pass)} cards to pass, expected 3.")
+            
+            for card in cards_to_pass:
+                if card not in player.hand:
+                    raise ValueError(f"Player {i} tried to pass card {card} not in hand.")
+                player.hand.remove(card)
+            
+            passed_cards_map[i] = cards_to_pass
+
+        # 2. Distribute cards
         for i in range(4):
-            player_idx = (first_player + i) % 4
-            player = self.gamestate.players[player_idx]
-            is_first = (self.rounds == 1)
-            print(f'player {player_idx}\'s avilable actions: {sorted(available_actions(player, self.gamestate.current_suit, is_first, scored))}')
-            actions = available_actions(player, self.gamestate.current_suit, is_first, scored)
-            card = policies[player_idx](player, self.get_info(player_idx), actions, i)
-            if not self.gamestate.piggy_pulled and (card.suit == Suit.SPADES and card.rank == 12):
-                self.gamestate.piggy_pulled = True
-                self.gamestate.hearts_broken = True
-            if card.suit == Suit.HEARTS and not self.gamestate.hearts_broken:
-                self.gamestate.hearts_broken = True
-            if card not in actions:
-                print(f'player{player_idx} was caught cheating!')
-                print('you su...')
-                raise ValueError(f'player {player_idx} played invalid card {card}, available actions: {actions}')
-            player.hand.remove(card)
-            player.table.append(card)
-            table.append((card, player_idx))
-            self.gamestate.table.append((card, player_idx))
-            self.gamestate.current_table.append((card, player_idx))
-            print(f'player {player_idx} plays {card}')
-            if i == 0:
-                self.gamestate.current_suit = card.suit
+            target_idx = -1
+            if pass_direction == PassDirection.LEFT:
+                target_idx = (i + 1) % 4
+            elif pass_direction == PassDirection.RIGHT:
+                target_idx = (i - 1) % 4
+            elif pass_direction == PassDirection.ACROSS:
+                target_idx = (i + 2) % 4
+            
+            received_cards = passed_cards_map[target_idx] # Wait, if I am i, I receive from someone who passed TO me.
+            # Left (Clockwise): i passes to i+1. So i receives from i-1.
+            # Right (Counter-Clockwise): i passes to i-1. So i receives from i+1.
+            # Across: i passes to i+2. So i receives from i+2 (since +2 and -2 mod 4 are same).
+            
+            # Let's re-logic:
+            # We iterate over players who ARE RECEIVING.
+            # Or iterate over players who ARE PASSING and put into target.
+            pass
+        
+        # Let's iterate over SENDERS to make it easier
+        for sender_idx in range(4):
+            target_idx = -1
+            if pass_direction == PassDirection.LEFT:
+                target_idx = (sender_idx + 1) % 4
+            elif pass_direction == PassDirection.RIGHT:
+                target_idx = (sender_idx - 1) % 4
+            elif pass_direction == PassDirection.ACROSS:
+                target_idx = (sender_idx + 2) % 4
+            
+            cards = passed_cards_map[sender_idx]
+            self.gamestate.players[target_idx].hand.extend(cards)
+            
+            # We need to record what sender_idx passed and what they received.
+            # But we can't record received until everyone has passed.
+            # So we do this in two passes or just store it.
+            
+        # Sort hands after receiving
+        for player in self.gamestate.players:
+            player.hand.sort()
 
-        lead_cards = [(c, idx) for c, idx in table if c.suit == self.gamestate.current_suit]
-        winner_card, winner_idx = max(lead_cards, key=lambda x: (x[0].rank - 2) % 13)
-        value = sum(card_value(c) for c, _ in table)
-        self.gamestate.players[winner_idx].points += value
-        print(f'player {winner_idx} wins the round and gets {value} points')
-        print('-----------------------------------')
-        print()
-        return winner_idx
+        # Create events
+        for i in range(4):
+            # Who sent to i?
+            sender_to_i = -1
+            if pass_direction == PassDirection.LEFT:
+                sender_to_i = (i - 1) % 4
+            elif pass_direction == PassDirection.RIGHT:
+                sender_to_i = (i + 1) % 4
+            elif pass_direction == PassDirection.ACROSS:
+                sender_to_i = (i + 2) % 4
+            
+            received = passed_cards_map[sender_to_i]
+            passed = passed_cards_map[i]
+            
+            event = PassEvent(
+                player_id=i,
+                direction=pass_direction,
+                passed_cards=passed,
+                received_cards=received
+            )
+            pass_events.append(event)
+            
+        return pass_events
 
-    def play_round_training(self, first_player: int, policies: List[Callable], verbose: bool=False) -> tuple[int, int, Card, List[Card]]:
+    def play_trick(self, first_player_idx: int, policies: List[Callable], verbose: bool = False) -> Tuple[int, int, List[PlayEvent]]:
+        """
+        Play a single trick (one round of 4 cards).
+        
+        :param first_player_idx: Index of the player who leads.
+        :param policies: List of 4 policy functions.
+        :param verbose: Whether to print game state.
+        :return: (winner_idx, points_in_trick, events_log)
+        """
         self.gamestate.current_table = []
         self.gamestate.current_suit = None
+        
+        trick_events: List[PlayEvent] = []
+        trick_cards: List[Tuple[Card, int]] = []
+        
         if verbose:
-            print(f'round {self.rounds}:')
-            print()
-            for i, player in enumerate(self.gamestate.players):
-                print(f'player {i} hand:', sorted(player.hand))
-            print()
-            print('current points:', [p.points for p in self.gamestate.players])
-            print()
-        table: List[(Card, int)] = []
-        scored = any(p.points > 0 for p in self.gamestate.players)
-        for i in range(4):
-            player_idx = (first_player + i) % 4
-            player = self.gamestate.players[player_idx]
-            is_first = (self.rounds == 1)
+            print(f'--- Trick {self.rounds} ---')
+            for i, p in enumerate(self.gamestate.players):
+                print(f'Player {i} hand: {sorted(p.hand)}')
 
-            actions = available_actions(player, self.gamestate.current_suit, is_first, scored)
-            if player_idx == 0:
-                ai_actions = actions
+        # Check if hearts broken or scored condition for available_actions
+        # Original code used 'scored' = any(p.points > 0)
+        # But usually available_actions checks 'heart_broken' state directly inside?
+        # Wait, original available_actions takes 'scored' param.
+        # And inside it uses 'scored' to decide if hearts can be played/led.
+        # In original code: scored = any(p.points > 0 for p in self.gamestate.players)
+        # This implies "points have been taken by someone".
+        scored = any(p.points > 0 for p in self.gamestate.players)
+
+        for i in range(4):
+            current_player_idx = (first_player_idx + i) % 4
+            player = self.gamestate.players[current_player_idx]
+            is_first_trick = (self.rounds == 1)
+            
+            # Determine legal actions
+            legal_moves = available_actions(player, self.gamestate.current_suit, is_first_trick, scored)
             
             if verbose:
-                print(f'player {player_idx}\'s avilable actions: {sorted(actions)}')
+                print(f"Player {current_player_idx} legal moves: {legal_moves}")
 
-            card = policies[player_idx](player, self.get_info(player_idx), actions, i)
-            if player_idx == 0:
-                ai_action = card
+            # Get action from policy
+            # Policy signature: (player, player_info, legal_moves, order_in_trick) -> Card
+            # We need to construct player_info
+            p_info = self.get_player_info(current_player_idx)
+            selected_card = policies[current_player_idx](player, p_info, legal_moves, i)
+            
+            # Validate action
+            if selected_card not in legal_moves:
+                raise ValueError(f"Player {current_player_idx} played illegal card {selected_card}. Legal: {legal_moves}")
+
+            # Update State
+            player.hand.remove(selected_card)
+            
+            # Record Event
+            event = PlayEvent(
+                player_id=current_player_idx,
+                card=selected_card,
+                round_number=self.rounds, # Using rounds as trick number
+                trick_number=self.rounds,
+                is_lead=(i == 0),
+                current_table=list(self.gamestate.current_table),
+                heart_broken=self.gamestate.heart_broken,
+                piggy_pulled=self.gamestate.piggy_pulled,
+                legal_actions=legal_moves
+            )
+            trick_events.append(event)
+
+            # Update Game Logic
+            if not self.gamestate.piggy_pulled and (selected_card.suit == Suit.SPADES and selected_card.rank == 12):
+                self.gamestate.piggy_pulled = True
+                self.gamestate.heart_broken = True
+            
+            if selected_card.suit == Suit.HEARTS and not self.gamestate.heart_broken:
+                self.gamestate.heart_broken = True
+
+            # Add to tables
+            # player.table.append(selected_card) # Wait, player.table usually stores taken cards? 
+            # In original code: player.table.append(card) -> This seems to be "cards played by player"?
+            # Let's check original code: 
+            # player.table.append(card)
+            # table.append((card, player_idx))
+            # self.gamestate.table.append((card, player_idx))
+            # self.gamestate.current_table.append((card, player_idx))
+            
+            # If player.table is "cards played by this player historically", then yes.
+            player.table.append(selected_card) 
+            
+            self.gamestate.table.append((selected_card, current_player_idx))
+            self.gamestate.current_table.append((selected_card, current_player_idx))
+            trick_cards.append((selected_card, current_player_idx))
+
+            if i == 0:
+                self.gamestate.current_suit = selected_card.suit
             
             if verbose:
-                print(f'player {player_idx} plays {card}')
+                print(f"Player {current_player_idx} plays {selected_card}")
 
-            if not self.gamestate.piggy_pulled and (card.suit == Suit.SPADES and card.rank == 12):
-                self.gamestate.piggy_pulled = True
-                self.gamestate.hearts_broken = True
-            if card.suit == Suit.HEARTS and not self.gamestate.hearts_broken:
-                self.gamestate.hearts_broken = True
-            if card not in actions:
-                # 玩家出了非法牌，返回一个惩罚信号
-                # winner_idx=None, ai_score=-100
-                return None, 100, ai_action, ai_actions
-            player.hand.remove(card)
-            player.table.append(card)
-            table.append((card, player_idx))
-            self.gamestate.table.append((card, player_idx))
-            self.gamestate.current_table.append((card, player_idx))
-            if i == 0:
-                self.gamestate.current_suit = card.suit
+        # Determine Winner
+        lead_suit_cards = [(c, pid) for c, pid in trick_cards if c.suit == self.gamestate.current_suit]
+        # Highest rank wins. Ace is 1? Wait, Card rank: 1-13.
+        # Original code: key=lambda x: (x[0].rank - 2) % 13
+        # If rank 1 (Ace), (1-2)%13 = -1%13 = 12 (Highest)
+        # If rank 13 (King), (13-2)%13 = 11
+        # If rank 2, (2-2)%13 = 0 (Lowest)
+        # So Ace is high.
+        winner_card, winner_idx = max(lead_suit_cards, key=lambda x: (x[0].rank - 2) % 13)
         
-        lead_cards = [(c, idx) for c, idx in table if c.suit == self.gamestate.current_suit]
-        winner_card, winner_idx = max(lead_cards, key=lambda x: (x[0].rank - 2) % 13)
-        value = sum(card_value(c) for c, _ in table)
-        ai_score = 0
-        if winner_idx == 0:
-            ai_score = value
-        self.gamestate.players[winner_idx].points += value
+        # Calculate Points
+        points = sum(card_value(c) for c, _ in trick_cards)
+        
+        # Update Winner Stats
+        self.gamestate.players[winner_idx].points += points
+        # In original code, winner also gets the cards added to their 'table'? 
+        # No, original code: player.table.append(card) happened during play.
+        # But wait, usually 'table' in Player struct might mean 'tricks taken'?
+        # Original code: player.table.append(card) happens when they PLAY the card.
+        # So player.table is history of played cards.
+        
+        # Record Trick History
+        record = TrickRecord(winner=winner_idx, score=points, lead_suit=self.gamestate.current_suit)
+        self.trick_history.append(record)
+        
         if verbose:
-            print(f'player {winner_idx} wins the round and gets {value} points')
-            print('-----------------------------------')
-            print()
-        return winner_idx, ai_score, ai_action, ai_actions
+            print(f"Player {winner_idx} wins trick with {points} points.")
+            print("-" * 20)
 
-    def play_round_human_0(self, first_player: int, policies: List[Callable]) -> int:
-        self.gamestate.current_table = []
-        self.gamestate.current_suit = None
-        print(f'round {self.rounds}:')
-        print()
-        print('your hand:', sorted(self.gamestate.players[0].hand))
-        print()
-        print('current points:', [p.points for p in self.gamestate.players])
-        print()
-        table: List[(Card, int)] = []
-        scored = any(p.points > 0 for p in self.gamestate.players)
-        for i in range(4):
-            player_idx = (first_player + i) % 4
-            player = self.gamestate.players[player_idx]
-            is_first = (self.rounds == 1)
-            actions = available_actions(player, self.gamestate.current_suit, is_first, scored)
-            card = policies[player_idx](player, self.get_info(player_idx), actions, i)
-            if not self.gamestate.piggy_pulled and (card.suit == Suit.SPADES and card.rank == 12):
-                self.gamestate.piggy_pulled = True
-                self.gamestate.hearts_broken = True
-            if card.suit == Suit.HEARTS and not self.gamestate.hearts_broken:
-                self.gamestate.hearts_broken = True
-            if card not in actions:
-                print(f'player{player_idx} was caught cheating!')
-                print('move your ass out of here')
-                raise ValueError(f'{player_idx} played invalid card {card}, available actions: {actions}')
-            player.hand.remove(card)
-            player.table.append(card)
-            table.append((card, player_idx))
-            self.gamestate.table.append((card, player_idx))
-            self.gamestate.current_table.append((card, player_idx))
-            print(f'player {player_idx} plays {card}')
-            if i == 0:
-                self.gamestate.current_suit = card.suit
+        return winner_idx, points, trick_events
+
+    def run_game_training(self, policies: List[Callable], pass_policies: Optional[List[Callable]] = None, pass_direction: PassDirection = PassDirection.KEEP) -> Tuple[List[int], List[int], List[Any], List[TrickRecord]]:
+        """
+        Run a full game for training purposes.
+        Returns final scores, raw scores, list of all events, and trick history.
+        """
+        self.reset()
+        all_events = []
+
+        # Passing Phase
+        if pass_direction != PassDirection.KEEP:
+            self.pass_direction = pass_direction # Store it
+            if pass_policies is None:
+                # Default random pass policy if none provided
+                def random_pass(p, info):
+                    return random.sample(p.hand, 3)
+                pass_policies = [random_pass] * 4
+            
+            pass_events = self.perform_pass(pass_direction, pass_policies)
+            all_events.extend(pass_events)
+
+        first_player = self.gamestate.get_first_player()
         
-        lead_cards = [(c, idx) for c, idx in table if c.suit == self.gamestate.current_suit]
-        winner_card, winner_idx = max(lead_cards, key=lambda x: (x[0].rank - 2) % 13)
-        value = sum(card_value(c) for c, _ in table)
-        self.gamestate.players[winner_idx].points += value
-        print(f'player {winner_idx} wins the round and gets {value} points')
-        print('-----------------------------------')
-        print()
-        return winner_idx
+        for _ in range(13):
+            winner, _, events = self.play_trick(first_player, policies, verbose=False)
+            first_player = winner
+            all_events.extend(events)
+            self.rounds += 1
+            
+        scores = self.end_game_scoring()
+        raw_scores = [p.points for p in self.gamestate.players]
+        return scores, raw_scores, all_events, self.trick_history
 
-    def end_game(self) -> tuple[List[int], bool]:
+    def run_game_showcase(self, policies: List[Callable], pass_policies: Optional[List[Callable]] = None, pass_direction: PassDirection = PassDirection.KEEP) -> List[int]:
+        """
+        Run a full game with verbose output for demonstration.
+        """
+        self.reset()
+        
+        # Passing Phase
+        if pass_direction != PassDirection.KEEP:
+            print(f"--- Passing Phase ({pass_direction.name}) ---")
+            if pass_policies is None:
+                def random_pass(p, info):
+                    return random.sample(p.hand, 3)
+                pass_policies = [random_pass] * 4
+                
+            pass_events = self.perform_pass(pass_direction, pass_policies)
+            for event in pass_events:
+                print(f"Player {event.player_id} passed {event.passed_cards} and received {event.received_cards}")
+            print("-" * 20)
+
+        first_player = self.gamestate.get_first_player()
+        
+        for _ in range(13):
+            winner, _, _ = self.play_trick(first_player, policies, verbose=True)
+            first_player = winner
+            self.rounds += 1
+            
+        scores = self.end_game_scoring()
+        print("Final Scores:", scores)
+        return scores
+
+    def end_game_scoring(self) -> List[int]:
+        """
+        Handle Shooting the Moon logic and return final scores.
+        """
         scores = [p.points for p in self.gamestate.players]
         if 26 in scores:
-            for p in self.gamestate.players:
-                if p.points != 26:
-                    p.points = 26
+            # Shooting the Moon
+            new_scores = []
+            for s in scores:
+                if s == 26:
+                    new_scores.append(0)
                 else:
-                    p.points = 0
-            return [p.points for p in self.gamestate.players], True
-        return scores, False
-    
-    def end_game_error(self, text=None) -> List[int]:
-        print(f'error: {text}')
-        return [p.points for p in self.gamestate.players]
-
-    def fight(self, policies: List[Callable], training: bool=False, human_0: bool=False, trick=False, verbose: bool=False) -> Union[List[int], tuple[List[int], bool, List[int], List[Card], List[List[Card]], List[dict]], None]:
-        self.reset(trick)
-        #try:
-        first_player = self.gamestate.get_first_player()
-        if training:
-            ai_score_delta = []
-            ai_actions = []
-            ai_masks = []
-            ai_info = []
-            while self.rounds <= 13:
-                ai_info.append(self.get_info(0))
-                first_player, a_s_d, a_a, a_m = self.play_round_training(first_player, policies, verbose)
-                ai_actions.append(a_a)
-                ai_masks.append(a_m)
-                ai_score_delta.append(a_s_d)
-                if first_player is None:
-                    # 非法操作，游戏提前结束
-                    # 返回当前得分，shot=False，以及到目前为止的记录
-                    return [p.points for p in self.gamestate.players], None, ai_score_delta, ai_actions, ai_masks, ai_info
-                self.rounds += 1
-            score, shot = self.end_game()
-            #print('final points:', score)
-            #if shot:
-            #    print('shooting the moon!!')
-            return score, shot, ai_score_delta, ai_actions, ai_masks, ai_info
-        
-        elif human_0:
-            while self.rounds <= 13:
-                first_player = self.play_round_human_0(first_player, policies)
-                self.rounds += 1
-            score, shot = self.end_game()
-            print('final points:', score)
-            if shot:
-                print('shooting the moon!!')
-            return score
-        
-        else:
-            while self.rounds <= 13:
-                first_player = self.play_round(first_player, policies)
-                self.rounds += 1
-            score, shot = self.end_game()
-            print('final points:', score)
-            if shot:
-                print('shooting the moon!!')
-            return score
-            
-        #except Exception as e:
-            if not training:
-                print()
-                print('something fishy happend......')
-            return self.end_game_error(e)
+                    new_scores.append(26)
+            return new_scores
+        return scores
 
 if __name__ == '__main__':
-    def random_policy(player: Player, player_info: Callable, actions: List[Card], order: int) -> Card:
+    # Simple test
+    def random_policy(player, info, actions, order):
         return random.choice(actions)
-    Hearts = Game()
-    Hearts.fight([random_policy]*4)
+    
+    game = GameV2()
+    print("Running Showcase Game with Passing (LEFT)...")
+    game.run_game_showcase([random_policy] * 4, pass_direction=PassDirection.LEFT)
