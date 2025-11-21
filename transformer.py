@@ -331,7 +331,7 @@ class HeartsTransformer(nn.Module):
             nn.Linear(9, d_model)   # game_stats (Updated to 9)
         ])
         
-        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, batch_first=True)
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         
         # Output head - predicting card probabilities (52 cards)
@@ -397,7 +397,11 @@ class HeartsTransformer(nn.Module):
                                      info.get('pass_direction', PassDirection.KEEP),
                                      info.get('is_passing', False))
 
-    def assemble_input(self, device=None, dtype=torch.float32):
+    def get_raw_state(self):
+        """Return a snapshot of the current raw matrix data."""
+        return [m.matrix.clone().detach() for m in self.matrix]
+
+    def assemble_input(self, raw_state=None, device=None, dtype=torch.float32):
         """
         Assemble the cached matrices into a sequence of embeddings.
         Instead of a block diagonal sparse matrix (which is huge and mostly empty),
@@ -408,8 +412,10 @@ class HeartsTransformer(nn.Module):
             device = next(self.parameters()).device
 
         embeddings = []
-        for i, mat_obj in enumerate(self.matrix):
-            tensor = mat_obj.matrix
+        # Use provided raw_state or internal self.matrix
+        sources = raw_state if raw_state is not None else [m.matrix for m in self.matrix]
+
+        for i, tensor in enumerate(sources):
             if not isinstance(tensor, torch.Tensor):
                 tensor = torch.tensor(tensor, dtype=dtype, device=device)
             else:
@@ -422,23 +428,54 @@ class HeartsTransformer(nn.Module):
         # Concatenate along sequence dimension (dim 0)
         # Result: (Total_Seq_Len, d_model)
         return torch.cat(embeddings, dim=0)
-
-    def forward(self, x=None):
-        # If x is not provided, assemble from internal state
-        if x is None:
-            x = self.assemble_input()
+    
+    def assemble_batch(self, batch_raw_states, device=None, dtype=torch.float32):
+        """
+        Assemble a batch of raw states into a single tensor.
+        batch_raw_states: List[List[Tensor]]
+        Returns: (Batch, Seq_Len, d_model)
+        """
+        if device is None:
+            device = next(self.parameters()).device
             
-        # Transformer expects (Seq_Len, Batch, Dim) or (Batch, Seq_Len, Dim)
-        # Here we have (Seq_Len, Dim), so add batch dim
-        x = x.unsqueeze(1) # (Seq_Len, 1, Dim)
+        # Transpose list of lists: [[m1, m2...], [m1, m2...]] -> [[m1, m1...], [m2, m2...]]
+        num_matrices = len(self.matrix)
+        batched_sources = [[] for _ in range(num_matrices)]
         
+        for state in batch_raw_states:
+            for i, m in enumerate(state):
+                batched_sources[i].append(m)
+                
+        embeddings = []
+        for i, matrix_list in enumerate(batched_sources):
+            # Stack: (Batch, Rows, Cols)
+            stacked = torch.stack([m.to(device=device, dtype=dtype) for m in matrix_list])
+            
+            # Project: (Batch, Rows, d_model)
+            proj = self.input_projections[i](stacked)
+            embeddings.append(proj)
+            
+        # Concatenate along sequence dimension (dim 1)
+        return torch.cat(embeddings, dim=1)
+
+    def forward(self, x=None, raw_state=None, batch_raw_states=None):
+        # If x is not provided, assemble from internal state or provided raw_state
+        if batch_raw_states is not None:
+            x = self.assemble_batch(batch_raw_states)
+            # x is (Batch, Seq_Len, Dim)
+        elif x is None:
+            x = self.assemble_input(raw_state=raw_state)
+            # x is (Seq_Len, Dim) -> unsqueeze -> (1, Seq_Len, Dim)
+            x = x.unsqueeze(0)
+            
         output = self.transformer_encoder(x)
         
         # We might want to pool or take specific token outputs
         # For now, let's take the mean or the last token?
         # Or maybe we want a specific "action" token?
         # Let's take the mean for now
-        pooled = output.mean(dim=0) 
+        # With batch_first=True, output is (Batch, Seq_Len, Dim), so mean over dim 1
+        pooled = output.mean(dim=1) 
         
         logits = self.output_head(pooled)
         value = self.value_head(pooled)

@@ -9,13 +9,31 @@ from typing import List, Dict, Any
 from game import GameV2
 from transformer import HeartsTransformer
 from data_structure import Card, PassDirection
+import copy
+from collections import deque
 
 # Hyperparameters
 LEARNING_RATE = 1e-4
 GAMMA = 0.99
-EPISODES = 1000
-BATCH_SIZE = 1 # Update every game for now
+EPISODES = 5000
+BATCH_SIZE = 32 # Update every 32 games
 HIDDEN_DIM = 128
+PPO_EPOCHS = 4
+CLIP_EPS = 0.2
+
+class OpponentPool:
+    def __init__(self, max_size=50):
+        self.pool = deque(maxlen=max_size)
+    
+    def add(self, model_state_dict):
+        # Store a deep copy of the state dict on CPU to save VRAM
+        state_copy = {k: v.cpu().clone() for k, v in model_state_dict.items()}
+        self.pool.append(state_copy)
+    
+    def sample(self):
+        if not self.pool:
+            return None
+        return random.choice(self.pool)
 
 class AIPlayer:
     def __init__(self, model: HeartsTransformer, device='cpu'):
@@ -23,6 +41,9 @@ class AIPlayer:
         self.device = device
         self.saved_log_probs = []
         self.saved_values = []
+        self.saved_states = [] # Store raw state snapshots
+        self.saved_actions = [] # Store action indices
+        self.saved_masks = [] # Store action masks
         self.rewards = []
         self.passed_cards = []
         self.received_cards = []
@@ -31,6 +52,9 @@ class AIPlayer:
     def reset(self):
         self.saved_log_probs = []
         self.saved_values = []
+        self.saved_states = []
+        self.saved_actions = []
+        self.saved_masks = []
         self.rewards = []
         self.passed_cards = []
         self.received_cards = []
@@ -58,6 +82,10 @@ class AIPlayer:
                 received_cards=[] # Not received yet
             )
             
+            # Snapshot state for PPO
+            state_snapshot = self.model.get_raw_state()
+            self.saved_states.append(state_snapshot)
+
             # 2. Forward pass
             logits, value = self.model(x=None)
             logits = logits.squeeze() # (52)
@@ -66,6 +94,8 @@ class AIPlayer:
             mask = torch.full((52,), float('-inf'), device=self.device)
             legal_indices = [c.to_id() for c in current_hand]
             mask[legal_indices] = 0
+            self.saved_masks.append(mask) # Save mask
+            
             masked_logits = logits + mask
             
             # 4. Sample action
@@ -76,6 +106,7 @@ class AIPlayer:
             # 5. Save log prob and value for training
             self.saved_log_probs.append(dist.log_prob(action_idx))
             self.saved_values.append(value)
+            self.saved_actions.append(action_idx)
             
             # 6. Decode card
             suit_val = action_idx.item() // 13
@@ -90,7 +121,7 @@ class AIPlayer:
         self.passed_cards = selected_cards
         return selected_cards
 
-    def play_policy(self, player, info, legal_actions, order):
+    def play_policy(self, player, info, legal_actions, order, override_policy=None):
         # Deduce received cards if not already done and we passed cards
         if not self.received_cards and self.passed_cards:
              remaining = self.hand_before_pass - set(self.passed_cards)
@@ -106,6 +137,10 @@ class AIPlayer:
             received_cards=self.received_cards
         )
         
+        # Snapshot state for PPO
+        state_snapshot = self.model.get_raw_state()
+        self.saved_states.append(state_snapshot)
+        
         # Forward pass
         # Ensure we pass the device to assemble_input implicitly by not passing x
         # The model's assemble_input now checks self.parameters().device
@@ -119,6 +154,7 @@ class AIPlayer:
         # Set legal actions to 0 (or keep logits)
         legal_indices = [c.to_id() for c in legal_actions]
         mask[legal_indices] = 0
+        self.saved_masks.append(mask) # Save mask
         
         # Add mask to logits
         masked_logits = logits + mask
@@ -128,20 +164,27 @@ class AIPlayer:
         
         # Sample action
         dist = torch.distributions.Categorical(probs)
-        action_idx = dist.sample()
+        
+        if override_policy:
+            # Use the override policy to select a card
+            selected_card = override_policy(player, info, legal_actions, order)
+            # Find the index of this card to store it as the "action taken"
+            # This is important if we want to do Behavior Cloning later, 
+            # but for Value Pretraining we just need the trajectory to be valid.
+            # We still store it so the PPO loop structure doesn't break (though we won't use it for policy update in pretrain)
+            action_idx = torch.tensor(selected_card.to_id(), device=self.device)
+        else:
+            action_idx = dist.sample()
+            # Convert index back to Card
+            # 0..51 -> Suit * 13 + (Rank-1)
+            suit_val = action_idx.item() // 13
+            rank_val = (action_idx.item() % 13) + 1
+            selected_card = Card(suit=list(from_suit_int(suit_val))[0], rank=rank_val)
         
         # Save log prob and value
         self.saved_log_probs.append(dist.log_prob(action_idx))
         self.saved_values.append(value)
-        
-        # Convert index back to Card
-        # 0..51 -> Suit * 13 + (Rank-1)
-        suit_val = action_idx.item() // 13
-        rank_val = (action_idx.item() % 13) + 1
-        
-        # Find the actual card object in legal_actions to ensure object identity if needed
-        # (Though Card is a dataclass so equality works by value)
-        selected_card = Card(suit=list(from_suit_int(suit_val))[0], rank=rank_val)
+        self.saved_actions.append(action_idx)
         
         return selected_card
 
@@ -172,6 +215,101 @@ def max_policy(player, info, legal_actions, order):
     # Play the largest card (strongest)
     return max(legal_actions, key=get_card_strength)
 
+def pretrain_value_net(model, optimizer, device, episodes=200):
+    print(f"Starting Value Network Pretraining for {episodes} episodes...")
+    game = GameV2()
+    ai_player = AIPlayer(model, device)
+    
+    # We will use a mix of Min and Max policies to generate diverse "competent" gameplay data
+    # The AIPlayer will run in "Shadow Mode": predicting values but playing heuristic moves.
+    
+    running_loss = 0.0
+    
+    for i_episode in range(episodes):
+        ai_player.reset()
+        
+        # Randomly choose a heuristic for the "Main Player" (Shadow Mode)
+        # This ensures the ValueNet sees states resulting from different styles of play
+        main_heuristic = random.choice([min_policy, max_policy, random_policy])
+        
+        # Opponents
+        p1_policy = random.choice([min_policy, max_policy, random_policy])
+        p2_policy = random.choice([min_policy, max_policy, random_policy])
+        p3_policy = random.choice([min_policy, max_policy, random_policy])
+        
+        # Pass policies (random for now)
+        pass_policies = [random_pass_policy] * 4
+        
+        # Wrapper to inject heuristic into AIPlayer
+        def shadow_policy(player, info, legal_actions, order):
+            return ai_player.play_policy(player, info, legal_actions, order, override_policy=main_heuristic)
+            
+        current_policies = [shadow_policy, p1_policy, p2_policy, p3_policy]
+        
+        pass_dir = random.choice([PassDirection.LEFT, PassDirection.RIGHT, PassDirection.ACROSS, PassDirection.KEEP])
+        
+        # Run Game
+        scores, raw_scores, events, trick_history = game.run_game_training(current_policies, pass_policies, pass_direction=pass_dir)
+        
+        # Calculate Rewards (Same as training)
+        player_final_score = scores[0]
+        player_raw_score = raw_scores[0]
+        shot_the_moon = (player_raw_score == 26)
+        
+        rewards = []
+        if pass_dir != PassDirection.KEEP:
+             # Scale rewards by 0.01
+             pass_reward = 0.5 if shot_the_moon else -float(player_final_score) / 100.0
+             for _ in range(3):
+                 rewards.append(pass_reward)
+
+        for trick in trick_history:
+            if shot_the_moon:
+                r = 0.04 
+            else:
+                points_taken = trick.score if trick.winner == 0 else 0
+                if points_taken > 0:
+                    r = -float(points_taken) / 100.0
+                else:
+                    r = 0.002 
+                    if trick.winner != 0 and trick.score > 0:
+                        r += 0.01
+            rewards.append(r)
+            
+        # Update Value Net Only
+        optimizer.zero_grad()
+        
+        # Alignment
+        if len(rewards) != len(ai_player.saved_values):
+            min_len = min(len(rewards), len(ai_player.saved_values))
+            rewards = rewards[:min_len]
+            ai_player.saved_values = ai_player.saved_values[:min_len]
+
+        # Calculate Returns
+        R = 0
+        returns = []
+        for r in reversed(rewards):
+            R = r + GAMMA * R
+            returns.insert(0, R)
+            
+        returns = torch.tensor(returns).to(device)
+        # NOTE: We do NOT normalize returns for Value Pretraining to learn absolute scale
+        
+        values = torch.stack(ai_player.saved_values).squeeze()
+        
+        # MSE Loss
+        loss = torch.nn.functional.mse_loss(values, returns)
+        loss.backward()
+        optimizer.step()
+        
+        running_loss += loss.item()
+        
+        if (i_episode + 1) % 50 == 0:
+            print(f"Pretrain Episode {i_episode+1}/{episodes}\tAvg Value Loss: {running_loss/50:.4f}")
+            running_loss = 0.0
+            
+    print("Value Network Pretraining Complete.")
+
 def train():
     model_path = 'hearts_model.pth'
     
@@ -197,15 +335,18 @@ def train():
 
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
     
+    # Pretrain Value Network
+    pretrain_value_net(model, optimizer, device, episodes=200)
+    
     game = GameV2()
     ai_player = AIPlayer(model, device)
     
-    # Create opponent AI instances for Self-Play
-    # They share the same model weights but maintain their own game state
-    opponent_agents = [AIPlayer(model, device) for _ in range(3)]
+    # Opponent Pool Setup
+    pool = OpponentPool()
     
-    # We will train Player 0
-    # Players 1, 2, 3 will evolve based on curriculum
+    # Create separate opponent models for stable self-play
+    opponent_models = [HeartsTransformer(d_model=HIDDEN_DIM).to(device) for _ in range(3)]
+    opponent_agents = [AIPlayer(opp_model, device) for opp_model in opponent_models]
     
     running_reward = 0
     running_score = 0
@@ -220,64 +361,66 @@ def train():
         'difficulty': []
     }
     
+    # Batch buffers
+    batch_log_probs = []
+    batch_values = []
+    batch_states = []
+    batch_actions = []
+    batch_masks = []
+    batch_returns = []
+
     for i_episode in range(EPISODES):
         ai_player.reset()
         for opp in opponent_agents:
             opp.reset()
+            
+        # Update Pool periodically
+        if i_episode % 50 == 0:
+            pool.add(model.state_dict())
         
         # Dynamic Difficulty Curriculum
         progress = i_episode / EPISODES
         difficulty = "Random"
         
-        # Default: Random
-        p1_policy = random_policy
-        p2_policy = random_policy
-        p3_policy = random_policy
+        # Default Policies
+        p_policies = [random_policy] * 3
+        pass_policies = [random_pass_policy] * 3
         
-        p1_pass = random_pass_policy
-        p2_pass = random_pass_policy
-        p3_pass = random_pass_policy
-        
-        if progress < 0.2:
-            # Stage 1: Beginner (Random)
-            difficulty = "Beginner (Random)"
+        if progress < 0.3:
+            # Stage 1: Basic Heuristics (Deterministic)
+            # Start with Min/Max as they are more "logical" and easier to learn basic mechanics from.
+            difficulty = "Beginner (Heuristics)"
+            p_policies = [min_policy, min_policy, max_policy] # 2 Conservative, 1 Aggressive
             
-        elif progress < 0.5:
-            # Stage 2: Intermediate (Heuristics)
-            # Opponents play conservatively (Min) or aggressively (Max)
-            difficulty = "Intermediate (Heuristics)"
-            p1_policy = min_policy
-            p2_policy = min_policy
-            p3_policy = max_policy # One chaotic player
-            
-        elif progress < 0.8:
-            # Stage 3: Advanced (Mixed AI + Heuristics)
-            # One opponent is a copy of the current AI (Self-Play)
-            difficulty = "Advanced (1 AI + Heuristics)"
-            p1_policy = opponent_agents[0].play_policy
-            p1_pass = opponent_agents[0].pass_policy
-            p2_policy = min_policy
-            p3_policy = min_policy
+        elif progress < 0.6:
+            # Stage 2: Introducing Chaos (Random)
+            # Now that we know the rules, handle unpredictable random players which can be harder.
+            difficulty = "Intermediate (Random + Heuristics)"
+            p_policies = [random_policy, min_policy, max_policy]
             
         else:
-            # Stage 4: Expert (Full Self-Play)
-            # All opponents are current AI
-            difficulty = "Expert (Self-Play)"
-            p1_policy = opponent_agents[0].play_policy
-            p1_pass = opponent_agents[0].pass_policy
-            p2_policy = opponent_agents[1].play_policy
-            p2_pass = opponent_agents[1].pass_policy
-            p3_policy = opponent_agents[2].play_policy
-            p3_pass = opponent_agents[2].pass_policy
+            # Stage 3: Advanced (Pool + Self-Play)
+            difficulty = "Advanced (Pool + Heuristics)"
+            # Mix of Pool and Heuristics
+            for i in range(3):
+                if pool.pool and random.random() < 0.7: # 70% chance to play against past self
+                    past_state = pool.sample()
+                    opponent_models[i].load_state_dict(past_state)
+                    p_policies[i] = opponent_agents[i].play_policy
+                    pass_policies[i] = opponent_agents[i].pass_policy
+                else:
+                    # Fallback to heuristics/random mix
+                    p_policies[i] = random.choice([min_policy, max_policy, random_policy])
+                    pass_policies[i] = random_pass_policy
 
-        current_policies = [ai_player.play_policy, p1_policy, p2_policy, p3_policy]
-        pass_policies = [ai_player.pass_policy, p1_pass, p2_pass, p3_pass]
+        current_policies = [ai_player.play_policy] + p_policies
+        current_pass_policies = [ai_player.pass_policy] + pass_policies
         
         # Random pass direction
         pass_dir = random.choice([PassDirection.LEFT, PassDirection.RIGHT, PassDirection.ACROSS, PassDirection.KEEP])
         
         # Run Game
-        scores, raw_scores, events, trick_history = game.run_game_training(current_policies, pass_policies, pass_direction=pass_dir)
+        scores, raw_scores, events, trick_history = game.run_game_training(current_policies, current_pass_policies, pass_direction=pass_dir)
         
         # Calculate Reward for Player 0
         player_final_score = scores[0]
@@ -290,33 +433,32 @@ def train():
         if pass_dir != PassDirection.KEEP:
              # Assign final game outcome proxy to passing
              # If STM, big bonus. If not, negative score.
-             pass_reward = 50.0 if shot_the_moon else -float(player_final_score)
+             # Scale rewards by 0.01 to keep values in reasonable range (-0.26 to +0.26 approx)
+             pass_reward = 0.5 if shot_the_moon else -float(player_final_score) / 100.0
              for _ in range(3):
                  rewards.append(pass_reward)
 
         # 2. Play Rewards (Trick by Trick)
         for trick in trick_history:
             if shot_the_moon:
-                r = 4.0 # Reward for every step leading to STM
+                r = 0.04 # Reward for every step leading to STM
             else:
                 points_taken = trick.score if trick.winner == 0 else 0
                 
                 if points_taken > 0:
                     # We took points -> Penalty
-                    r = -float(points_taken)
+                    r = -float(points_taken) / 100.0
                 else:
                     # We didn't take points -> Small Reward
-                    r = 0.2 
+                    r = 0.002 
                     
                     # Extra bonus if we specifically dodged points (someone else took them)
                     if trick.winner != 0 and trick.score > 0:
-                        r += 1.0
+                        r += 0.01
             rewards.append(r)
             
         # Update Policy
         optimizer.zero_grad()
-        policy_loss = []
-        value_loss = []
         
         # Ensure alignment
         if len(rewards) != len(ai_player.saved_log_probs):
@@ -324,6 +466,9 @@ def train():
             rewards = rewards[:min_len]
             ai_player.saved_log_probs = ai_player.saved_log_probs[:min_len]
             ai_player.saved_values = ai_player.saved_values[:min_len]
+            ai_player.saved_states = ai_player.saved_states[:min_len]
+            ai_player.saved_actions = ai_player.saved_actions[:min_len]
+            ai_player.saved_masks = ai_player.saved_masks[:min_len]
 
         # Calculate Returns (Cumulative Discounted Reward)
         R = 0
@@ -332,35 +477,86 @@ def train():
             R = r + GAMMA * R
             returns.insert(0, R)
             
-        returns = torch.tensor(returns).to(device)
-        # Normalize returns for stability
-        if len(returns) > 1:
-            returns = (returns - returns.mean()) / (returns.std() + 1e-9)
+        # Accumulate to batch
+        batch_log_probs.extend(ai_player.saved_log_probs)
+        batch_values.extend(ai_player.saved_values)
+        batch_states.extend(ai_player.saved_states)
+        batch_actions.extend(ai_player.saved_actions)
+        batch_masks.extend(ai_player.saved_masks)
+        batch_returns.extend(returns)
 
-        # Calculate Advantage and Losses
-        for log_prob, value, R in zip(ai_player.saved_log_probs, ai_player.saved_values, returns):
-            advantage = R - value.item()
-            
-            # Policy Loss: -log_prob * advantage
-            policy_loss.append(-log_prob * advantage)
-            
-            # Value Loss: MSE(value, R)
-            # We use smooth_l1_loss or mse_loss
-            value_loss.append(torch.nn.functional.mse_loss(value.squeeze(), torch.tensor(R).to(device)))
-            
         current_p_loss = 0.0
         current_v_loss = 0.0
-        if policy_loss:
-            p_loss = torch.stack(policy_loss).sum()
-            v_loss = torch.stack(value_loss).sum()
+
+        # --- PPO Update (Batch) ---
+        if (i_episode + 1) % BATCH_SIZE == 0:
             
-            # Total Loss = Policy Loss + 0.5 * Value Loss
-            loss = p_loss + 0.5 * v_loss
+            # Convert batch lists to tensors
+            b_returns = torch.tensor(batch_returns).to(device)
             
-            loss.backward()
-            optimizer.step()
-            current_p_loss = p_loss.item()
-            current_v_loss = v_loss.item()
+            # Normalize returns for stability
+            if len(b_returns) > 1:
+                b_returns = (b_returns - b_returns.mean()) / (b_returns.std() + 1e-9)
+
+            # Detach old log probs and values for comparison
+            old_log_probs = torch.stack(batch_log_probs).detach()
+            old_values = torch.stack(batch_values).detach().squeeze()
+            
+            # Calculate Advantages (using old values)
+            advantages = b_returns - old_values
+            # Normalize advantages
+            if len(advantages) > 1:
+                advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-9)
+                
+            # PPO Epochs
+            for _ in range(PPO_EPOCHS):
+                # Batch processing
+                logits, new_values = model(batch_raw_states=batch_states)
+                logits = logits.squeeze() # (Batch, 52)
+                new_values = new_values.squeeze() # (Batch)
+                
+                # Masks
+                masks = torch.stack(batch_masks) # (Batch, 52)
+                masked_logits = logits + masks
+                
+                probs = torch.softmax(masked_logits, dim=1)
+                dist = torch.distributions.Categorical(probs)
+                
+                # Actions
+                b_actions = torch.stack(batch_actions)
+                new_log_probs = dist.log_prob(b_actions)
+                entropies = dist.entropy()
+                
+                # Ratio
+                ratio = torch.exp(new_log_probs - old_log_probs)
+                
+                # Surrogate Loss
+                surr1 = ratio * advantages
+                surr2 = torch.clamp(ratio, 1.0 - CLIP_EPS, 1.0 + CLIP_EPS) * advantages
+                policy_loss = -torch.min(surr1, surr2).mean()
+                
+                # Value Loss
+                value_loss = torch.nn.functional.mse_loss(new_values, b_returns)
+                
+                # Entropy Bonus
+                entropy_loss = -0.01 * entropies.mean()
+                
+                loss = policy_loss + 0.5 * value_loss + entropy_loss
+                
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                
+                current_p_loss = policy_loss.item()
+                current_v_loss = value_loss.item()
+            
+            # Clear batch buffers
+            batch_log_probs = []
+            batch_values = []
+            batch_states = []
+            batch_actions = []
+            batch_masks = []
+            batch_returns = []
             
         total_reward = sum(rewards)
         if i_episode == 0:
