@@ -1,33 +1,89 @@
-# 给模型提供者的 Hearts 游戏接入说明
+# Hearts AI (Transformer + PPO)
 
-这个仓库包含一个简单的 Hearts(黑桃)纸牌游戏实现, 和一个最小的 policy(策略)接口, 方便你把外部 AI 模型或启发式策略接入为玩家. 
+这是一个基于深度强化学习（Deep RL）的红心大战（Hearts）AI 项目。项目采用 **Transformer** 架构作为策略网络，结合了 **监督学习（Behavior Cloning）** 和 **PPO（Proximal Policy Optimization）** 算法进行训练，旨在打造一个既懂基本规则又能涌现高级战术（如“猪羊变色”、“逼出黑桃Q”）的智能 Agent。
 
-本文档说明仓库结构、policy 的 '契约'(模型会接收什么、需要返回什么)、示例, 以及如何在本地运行和验证. 
+## ✨ 核心特性
 
-## 仓库结构
+- **🧠 Transformer 架构**: 专为卡牌游戏设计的神经网络，能够处理手牌、牌桌状态和历史出牌记录。
+- **🎓 双阶段训练**:
+  1. **监督预训练 (Supervised Pretraining)**: 模仿内置的 "Expert" 专家策略，快速学会合法出牌和基础战术。
+  2. **强化学习 (PPO)**: 通过自我博弈（Self-Play）和 PPO 算法进一步优化，探索超越专家的策略。
+- **🕵️ 专家策略 (Expert Policy)**: 内置包含 "Piggy Hunting"（猎猪）逻辑的启发式 AI，懂得在低分段逼出黑桃 Q。
+- **📊 实时可视化**: 提供 Jupyter Notebook 仪表盘，实时监控训练 Loss、胜率和分数曲线。
+- **🎮 交互式展示**: `showcase.py` 允许你加载训练好的模型，观看 AI 对战或亲自下场切磋。
+- **🚀 性能优化**: 支持 GPU 加速、自动显卡选择、向量化 Batch 处理。
 
-- `game.py` — 核心游戏逻辑与环境, 定义了 `Card`、`Player`、`GameState`、游戏循环以及辅助函数. 
-- `Zhuiy_samplepolicy.py` — 一个最小示例策略, 展示了期望的函数签名. 
-- `data/` —(可选)可以放数据集或其他资源的文件夹. 
+## 📂 项目结构
 
-## Policy 接口
+| 文件 | 说明 |
+| :--- | :--- |
+| `train.py` | **训练主程序**。包含监督预训练和 PPO 训练循环，支持断点续传。 |
+| `transformer.py` | **模型定义**。定义了 `HeartsTransformer` 网络结构。 |
+| `strategies.py` | **策略库**。包含 `ExpertPolicy`（专家）、`Random`（随机）、`Min/Max` 等启发式策略。 |
+| `game.py` | **游戏引擎**。核心规则实现，支持训练模式和对战模式。 |
+| `showcase.py` | **展示脚本**。加载模型进行演示对战，支持人类玩家介入。 |
+| `visualization.ipynb` | **监控面板**。读取日志并绘制训练曲线（Loss, Score）。 |
+| `gpu_selector.py` | **工具**。自动检测并选择可用的 NVIDIA GPU。 |
+| `data_structure.py` | **数据结构**。定义 Card, Suit, Rank 等基础类。 |
 
-在 `game()` 中会传入一个 `policies` 列表, 每个元素都是一个可调用的策略函数. 
+## 🚀 快速开始
 
-当前 `game.py` 使用的签名为：
+### 1. 环境准备
 
-```py
-def policy(player: Player, player_info: dict, actions: List[Card], order: int) -> Card
+确保安装了 Python 3.8+ 和 PyTorch。
+
+```bash
+pip install torch numpy matplotlib
 ```
 
-参数说明：
-- `player`(`game.Player`): 对应当前玩家的 Player 对象, 包含 `hand`(手牌)、`points`(分数)、`table`(玩家的出牌记录). 这是运行时的对象, 供本地策略快速访问. 
-- `player_info`(`dict`): 为模型准备的“干净视图”, 包含键：`hand`, `points`, `table`, `round`(在 `game.py` 的 `player_info()` 中构造). 当你把状态发送到远程模型或不希望模型直接操作 `Player` 对象时, 应使用此字段. 
-- `actions`(`List[Card]`): 当前允许出的合法动作列表(Card 对象). 策略必须从中返回一个. 
-- `order`(`int`): 本轮中的出牌顺序(0 表示本轮第一个出牌的玩家, 1/2/3 表示后手). 
+### 2. 开始训练
 
-返回值：
-- 必须返回一个 `Card` 对象(或在进程内返回 Card 类型), 且该 Card 必须包含在 `actions` 中. 引擎会从玩家手牌中移除该卡并把它放到桌面上. 
+运行训练脚本，程序会自动进行预训练和 PPO 训练。
 
-为什么会传入 `player`：
-- `player` 便于获取内存中的完整状态(性能和便利性). 但模型提供者可以只使用 `player_info`, 完全忽略 `player`. 
+```bash
+python train.py
+```
+
+*训练过程中会生成 `training_log.json` 和模型权重 `hearts_model.pth`。*
+
+### 3. 监控训练
+
+在 VS Code 中打开 `visualization.ipynb` 并运行所有单元格。它会实时刷新图表，展示：
+
+- **Score**: AI 的得分（越低越好）。
+- **Policy Loss**: 策略网络的收敛情况。
+- **Value Loss**: 价值网络的预测误差。
+
+### 4. 观看演示
+
+训练完成后（或使用现有模型），运行展示脚本：
+
+```bash
+python showcase.py
+```
+
+你可以选择让 AI 互搏，或者自己加入游戏。
+
+## 🧠 算法细节
+
+### 输入表示
+
+模型接收 52 张牌的 One-hot 编码，结合位置编码（手牌、出牌区、历史记录），通过 Transformer Encoder 提取特征。
+
+### 奖励设计 (Reward Shaping)
+
+- **基础分**: 每吃一分红心扣分，吃黑桃 Q 大幅扣分。
+- **全红奖励 (Shoot the Moon)**: 如果成功集齐所有红心和黑桃 Q，给予正向大奖励。
+- **中间奖励**: 每一墩（Trick）结算时给予即时反馈，加速收敛。
+
+### 专家策略 (Expert Policy)
+
+我们在 `strategies.py` 中实现了一个强大的规则型 AI，它懂得：
+
+- **Piggy Hunting**: 当持有低点数黑桃且黑桃 Q 未出时，主动出黑桃逼迫对手出 Q。
+- **Voiding Suits**: 尽快出完某个花色以便垫牌。
+- **Safety First**: 在危险局面下优先出小牌。
+
+---
+
+*Created by zhuiyy*
