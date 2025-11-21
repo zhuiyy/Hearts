@@ -5,20 +5,21 @@ import sys
 from game import GameV2
 from transformer import HeartsTransformer
 from data_structure import Card, PassDirection, Suit
-
-# Import from train.py
-# We need to make sure we can import these. 
-# Assuming train.py is in the same directory.
-from train import AIPlayer, random_policy, random_pass_policy, min_policy, max_policy, HIDDEN_DIM
+from train import AIPlayer, HIDDEN_DIM
+import strategies
+import gpu_selector
 
 def print_card_list(cards):
     return ", ".join([str(c) for c in sorted(cards)])
 
-import torch.nn as nn
-
 def run_showcase():
     # 1. Load Model
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Use gpu_selector if interactive, or just auto-detect if not
+    if sys.stdin.isatty():
+        device = gpu_selector.select_device()
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
     print(f"Running on {device}")
     
     model = HeartsTransformer(d_model=HIDDEN_DIM).to(device)
@@ -27,8 +28,16 @@ def run_showcase():
     if os.path.exists(model_path):
         print(f"Loading model from {model_path}...")
         try:
-            state_dict = torch.load(model_path, map_location=device)
+            checkpoint = torch.load(model_path, map_location=device)
             
+            if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                state_dict = checkpoint['model_state_dict']
+                epoch = checkpoint.get('epoch', '?')
+                print(f"Model loaded from epoch {epoch}")
+            else:
+                state_dict = checkpoint
+                print("Loaded legacy model format.")
+
             # Auto-Patching for Architecture Changes
             if 'input_projections.5.weight' in state_dict:
                 old_weight = state_dict['input_projections.5.weight']
@@ -55,9 +64,9 @@ def run_showcase():
     print("\n" + "="*50)
     print(" STARTING SHOWCASE GAME ")
     print(" Player 0: AI Agent (Trained)")
-    print(" Player 1: Random Bot")
-    print(" Player 2: Min Bot (Plays smallest card)")
-    print(" Player 3: Min Bot (Plays smallest card)")
+    print(" Player 1: Expert Bot")
+    print(" Player 2: Random Bot")
+    print(" Player 3: Min Bot")
     print("="*50 + "\n")
     
     # Reset
@@ -78,7 +87,12 @@ def run_showcase():
         print(f"AI chose to pass:    {print_card_list(passed)}")
         return passed
 
-    pass_policies = [ai_pass_wrapper, random_pass_policy, random_pass_policy, random_pass_policy]
+    pass_policies = [
+        ai_pass_wrapper, 
+        strategies.ExpertPolicy.pass_policy, 
+        strategies.random_pass_policy, 
+        strategies.random_pass_policy
+    ]
     
     # Execute passing
     game.perform_pass(pass_dir, pass_policies)
@@ -100,46 +114,32 @@ def run_showcase():
 
     # Opponents
     policies = [
-        ai_play_wrapper, 
-        random_policy, 
-        min_policy, 
-        min_policy
+        ai_play_wrapper,
+        strategies.ExpertPolicy.play_policy,
+        strategies.random_policy,
+        strategies.min_policy
     ]
     
     first_player = game.gamestate.get_first_player()
     
     for round_num in range(1, 14):
-        print(f"\n[Trick {round_num}] Lead: Player {first_player}")
-        
-        winner, points, events = game.play_trick(first_player, policies, verbose=False)
-        
-        # Print what happened in the trick in order
-        for event in events:
-            p_id = event.player_id
-            card = event.card
-            if p_id == 0:
-                print(f"  >>> AI plays: {card} (Value Est: {current_trick_ai_value:.2f})")
-            else:
-                print(f"  Player {p_id} plays: {card}")
-                
-        print(f"Winner: Player {winner} takes {points} points.")
-        
-        # Check if hearts broken
-        if game.gamestate.heart_broken:
-            print("  (Hearts are broken)")
-            
+        print(f"\n--- Trick {round_num} ---")
+        winner, points, events = game.play_trick(first_player, policies, verbose=True)
         first_player = winner
         game.rounds += 1
-
-    # 5. Results
+        
+        # Print AI Value Prediction
+        print(f"AI Value Prediction: {current_trick_ai_value:.4f}")
+        
+    # Final Score
     scores = game.end_game_scoring()
     print("\n" + "="*50)
     print(" FINAL SCORES ")
-    print(f" AI (Player 0): {scores[0]}")
-    print(f" Player 1:      {scores[1]}")
-    print(f" Player 2:      {scores[2]}")
-    print(f" Player 3:      {scores[3]}")
-    print("="*50)
+    print(f" AI Agent: {scores[0]}")
+    print(f" Expert:   {scores[1]}")
+    print(f" Random:   {scores[2]}")
+    print(f" Min:      {scores[3]}")
+    print("="*50 + "\n")
 
 if __name__ == "__main__":
     run_showcase()

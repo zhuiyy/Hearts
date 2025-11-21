@@ -1,16 +1,18 @@
 import torch
 import torch.optim as optim
 import random
-import numpy as np
+import numpy
 import json
 import os
-import argparse
-from typing import List, Dict, Any
+from typing import List
 from game import GameV2
 from transformer import HeartsTransformer
 from data_structure import Card, PassDirection
-import copy
 from collections import deque
+import strategies
+from strategies import ExpertPolicy
+
+import gpu_selector
 
 # Hyperparameters
 LEARNING_RATE = 1e-4
@@ -195,50 +197,47 @@ def from_suit_int(val):
         if s.value == val:
             yield s
 
-def random_policy(player, info, legal_actions, order):
-    return random.choice(legal_actions)
-
-def random_pass_policy(player, info):
-    return random.sample(player.hand, 3)
-
-def get_card_strength(card):
-    # Ace (1) is highest (14), then King (13), ..., 2 is lowest
-    if card.rank == 1:
-        return 14
-    return card.rank
-
-def min_policy(player, info, legal_actions, order):
-    # Play the smallest card (weakest)
-    return min(legal_actions, key=get_card_strength)
-
-def max_policy(player, info, legal_actions, order):
-    # Play the largest card (strongest)
-    return max(legal_actions, key=get_card_strength)
-
-def pretrain_value_net(model, optimizer, device, episodes=200):
-    print(f"Starting Value Network Pretraining for {episodes} episodes...")
+def pretrain_supervised(model, optimizer, device, episodes=200):
+    print(f"Starting Supervised Pretraining (Policy + Value) for {episodes} episodes...")
     game = GameV2()
     ai_player = AIPlayer(model, device)
     
-    # We will use a mix of Min and Max policies to generate diverse "competent" gameplay data
-    # The AIPlayer will run in "Shadow Mode": predicting values but playing heuristic moves.
-    
     running_loss = 0.0
+    running_p_loss = 0.0
+    running_v_loss = 0.0
+    
+    # Batch buffers
+    batch_states = []
+    batch_actions = []
+    batch_masks = []
+    batch_returns = []
     
     for i_episode in range(episodes):
         ai_player.reset()
         
-        # Randomly choose a heuristic for the "Main Player" (Shadow Mode)
-        # This ensures the ValueNet sees states resulting from different styles of play
-        main_heuristic = random.choice([min_policy, max_policy, random_policy])
+        # Use Expert Policy as the teacher
+        main_heuristic = ExpertPolicy.play_policy
         
-        # Opponents
-        p1_policy = random.choice([min_policy, max_policy, random_policy])
-        p2_policy = random.choice([min_policy, max_policy, random_policy])
-        p3_policy = random.choice([min_policy, max_policy, random_policy])
+        # Opponents can be mixed
+        p1_policy = random.choice([strategies.min_policy, strategies.max_policy, strategies.random_policy, ExpertPolicy.play_policy])
+        p2_policy = random.choice([strategies.min_policy, strategies.max_policy, strategies.random_policy, ExpertPolicy.play_policy])
+        p3_policy = random.choice([strategies.min_policy, strategies.max_policy, strategies.random_policy, ExpertPolicy.play_policy])
         
-        # Pass policies (random for now)
-        pass_policies = [random_pass_policy] * 4
+        # Pass policies
+        # Use Expert Pass Policy for the main player to learn passing too!
+        # But our AIPlayer.pass_policy logic is autoregressive and complex to override directly with a simple function 
+        # that returns 3 cards at once.
+        # For now, let's focus on playing policy cloning. 
+        # If we want to clone passing, we need to adapt the shadow_pass_policy to return cards one by one or 
+        # force the AIPlayer to record the expert's choice.
+        
+        # Let's stick to random pass for opponents, but for the main player we want to learn expert passing?
+        # The current AIPlayer structure records actions one by one. 
+        # ExpertPolicy.pass_policy returns 3 cards.
+        # We can make a wrapper to feed them one by one?
+        # Or just ignore passing pretraining for now and focus on play.
+        # Let's use random pass for now to keep it simple, or implement a shadow pass later.
+        pass_policies = [strategies.random_pass_policy] * 4
         
         # Wrapper to inject heuristic into AIPlayer
         def shadow_policy(player, info, legal_actions, order):
@@ -251,14 +250,13 @@ def pretrain_value_net(model, optimizer, device, episodes=200):
         # Run Game
         scores, raw_scores, events, trick_history = game.run_game_training(current_policies, pass_policies, pass_direction=pass_dir)
         
-        # Calculate Rewards (Same as training)
+        # Calculate Rewards
         player_final_score = scores[0]
         player_raw_score = raw_scores[0]
         shot_the_moon = (player_raw_score == 26)
         
         rewards = []
         if pass_dir != PassDirection.KEEP:
-             # Scale rewards by 0.01
              pass_reward = 0.5 if shot_the_moon else -float(player_final_score) / 100.0
              for _ in range(3):
                  rewards.append(pass_reward)
@@ -276,14 +274,14 @@ def pretrain_value_net(model, optimizer, device, episodes=200):
                         r += 0.01
             rewards.append(r)
             
-        # Update Value Net Only
-        optimizer.zero_grad()
-        
         # Alignment
         if len(rewards) != len(ai_player.saved_values):
             min_len = min(len(rewards), len(ai_player.saved_values))
             rewards = rewards[:min_len]
             ai_player.saved_values = ai_player.saved_values[:min_len]
+            ai_player.saved_states = ai_player.saved_states[:min_len]
+            ai_player.saved_actions = ai_player.saved_actions[:min_len]
+            ai_player.saved_masks = ai_player.saved_masks[:min_len]
 
         # Calculate Returns
         R = 0
@@ -292,31 +290,74 @@ def pretrain_value_net(model, optimizer, device, episodes=200):
             R = r + GAMMA * R
             returns.insert(0, R)
             
-        returns = torch.tensor(returns).to(device)
-        # NOTE: We do NOT normalize returns for Value Pretraining to learn absolute scale
+        # Accumulate to batch
+        batch_states.extend(ai_player.saved_states)
+        batch_actions.extend(ai_player.saved_actions)
+        batch_masks.extend(ai_player.saved_masks)
+        batch_returns.extend(returns)
         
-        values = torch.stack(ai_player.saved_values).squeeze()
-        
-        # MSE Loss
-        loss = torch.nn.functional.mse_loss(values, returns)
-        loss.backward()
-        optimizer.step()
-        
-        running_loss += loss.item()
+        # Update every BATCH_SIZE episodes
+        if (i_episode + 1) % BATCH_SIZE == 0:
+            b_returns = torch.tensor(batch_returns).to(device)
+            b_actions = torch.stack(batch_actions)
+            
+            # Forward pass on batch
+            logits, values = model(batch_raw_states=batch_states)
+            logits = logits.squeeze() # (Batch, 52)
+            values = values.squeeze() # (Batch)
+            
+            # 1. Value Loss (MSE)
+            value_loss = torch.nn.functional.mse_loss(values, b_returns)
+            
+            # 2. Policy Loss (Cross Entropy / Behavior Cloning)
+            # We want to maximize log_prob of the action taken by the heuristic
+            # CrossEntropyLoss expects logits (unnormalized) and target indices
+            
+            # Apply mask to logits before CrossEntropy?
+            # CrossEntropyLoss doesn't take a mask, but we can set illegal logits to -inf
+            masks = torch.stack(batch_masks)
+            masked_logits = logits + masks
+            
+            policy_loss = torch.nn.functional.cross_entropy(masked_logits, b_actions)
+            
+            loss = policy_loss + 0.5 * value_loss
+            
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            
+            running_loss += loss.item()
+            running_p_loss += policy_loss.item()
+            running_v_loss += value_loss.item()
+            
+            # Clear batch
+            batch_states = []
+            batch_actions = []
+            batch_masks = []
+            batch_returns = []
         
         if (i_episode + 1) % 50 == 0:
-            print(f"Pretrain Episode {i_episode+1}/{episodes}\tAvg Value Loss: {running_loss/50:.4f}")
+            avg_loss = running_loss / (50 / BATCH_SIZE)
+            avg_p = running_p_loss / (50 / BATCH_SIZE)
+            avg_v = running_v_loss / (50 / BATCH_SIZE)
+            print(f"Pretrain Episode {i_episode+1}/{episodes}\tLoss: {avg_loss:.4f} (P: {avg_p:.4f}, V: {avg_v:.4f})")
             running_loss = 0.0
+            running_p_loss = 0.0
+            running_v_loss = 0.0
             
-    print("Value Network Pretraining Complete.")
+    print("Supervised Pretraining Complete.")
 
 def train():
     model_path = 'hearts_model.pth'
     
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = gpu_selector.select_device()
     print(f"Training on {device}")
     
     model = HeartsTransformer(d_model=HIDDEN_DIM).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    
+    start_episode = 0
+    loaded_from_checkpoint = False
     
     # Interactive Model Loading
     if os.path.exists(model_path):
@@ -324,8 +365,23 @@ def train():
         if user_input == 'y':
             print(f"Loading model from {model_path}...")
             try:
-                model.load_state_dict(torch.load(model_path, map_location=device))
+                checkpoint = torch.load(model_path, map_location=device)
+                
+                # Check if it's a new format checkpoint (dict) or old format (state_dict)
+                if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                    model.load_state_dict(checkpoint['model_state_dict'])
+                    if 'optimizer_state_dict' in checkpoint:
+                        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                    if 'epoch' in checkpoint:
+                        start_episode = checkpoint['epoch'] + 1
+                        print(f"Resuming from episode {start_episode}")
+                else:
+                    # Old format fallback
+                    model.load_state_dict(checkpoint)
+                    print("Loaded legacy model format (no epoch info). Starting from episode 0.")
+                
                 print("Model loaded successfully.")
+                loaded_from_checkpoint = True
             except Exception as e:
                 print(f"Failed to load model: {e}")
         else:
@@ -333,10 +389,12 @@ def train():
     else:
         print("No existing model found. Starting from scratch.")
 
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
     
-    # Pretrain Value Network
-    pretrain_value_net(model, optimizer, device, episodes=200)
+    # Pretrain if not loaded
+    if not loaded_from_checkpoint:
+        pretrain_supervised(model, optimizer, device, episodes=200)
+    else:
+        print("Skipping pretraining for loaded model.")
     
     game = GameV2()
     ai_player = AIPlayer(model, device)
@@ -369,7 +427,7 @@ def train():
     batch_masks = []
     batch_returns = []
 
-    for i_episode in range(EPISODES):
+    for i_episode in range(start_episode, start_episode + EPISODES):
         ai_player.reset()
         for opp in opponent_agents:
             opp.reset()
@@ -383,20 +441,20 @@ def train():
         difficulty = "Random"
         
         # Default Policies
-        p_policies = [random_policy] * 3
-        pass_policies = [random_pass_policy] * 3
+        p_policies = [strategies.random_policy] * 3
+        pass_policies = [strategies.random_pass_policy] * 3
         
         if progress < 0.3:
             # Stage 1: Basic Heuristics (Deterministic)
             # Start with Min/Max as they are more "logical" and easier to learn basic mechanics from.
             difficulty = "Beginner (Heuristics)"
-            p_policies = [min_policy, min_policy, max_policy] # 2 Conservative, 1 Aggressive
+            p_policies = [strategies.min_policy, strategies.min_policy, strategies.max_policy] # 2 Conservative, 1 Aggressive
             
         elif progress < 0.6:
             # Stage 2: Introducing Chaos (Random)
             # Now that we know the rules, handle unpredictable random players which can be harder.
             difficulty = "Intermediate (Random + Heuristics)"
-            p_policies = [random_policy, min_policy, max_policy]
+            p_policies = [strategies.random_policy, strategies.min_policy, strategies.max_policy]
             
         else:
             # Stage 3: Advanced (Pool + Self-Play)
@@ -410,8 +468,8 @@ def train():
                     pass_policies[i] = opponent_agents[i].pass_policy
                 else:
                     # Fallback to heuristics/random mix
-                    p_policies[i] = random.choice([min_policy, max_policy, random_policy])
-                    pass_policies[i] = random_pass_policy
+                    p_policies[i] = random.choice([strategies.min_policy, strategies.max_policy, strategies.random_policy, ExpertPolicy.play_policy])
+                    pass_policies[i] = strategies.random_pass_policy
 
         current_policies = [ai_player.play_policy] + p_policies
         current_pass_policies = [ai_player.pass_policy] + pass_policies
@@ -584,10 +642,18 @@ def train():
         
         if i_episode % 50 == 0:
             print(f"Episode {i_episode}\tAvg Score: {running_score:.2f}\tAvg Reward: {running_reward:.2f}\tPass: {pass_dir.name}\tDiff: {difficulty}")
-            torch.save(model.state_dict(), model_path)
+            torch.save({
+                'epoch': i_episode,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+            }, model_path)
 
     print("Training Complete.")
-    torch.save(model.state_dict(), model_path)
+    torch.save({
+        'epoch': start_episode + EPISODES - 1,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+    }, model_path)
 
 if __name__ == "__main__":
     train()
