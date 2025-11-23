@@ -434,7 +434,60 @@ def train():
     batch_masks = []
     batch_returns = []
 
-    for i_episode in range(start_episode, start_episode + EPISODES):
+    # --- Curriculum Setup ---
+    try:
+        total_episodes_input = input("Enter total episodes for PPO training (default 10000): ").strip()
+        TOTAL_EPISODES = int(total_episodes_input) if total_episodes_input else 10000
+    except ValueError:
+        TOTAL_EPISODES = 10000
+    
+    print(f"Total PPO Episodes: {TOTAL_EPISODES}")
+
+    # Define Stages (Opponent Configurations)
+    # Format: (Name, [Opponent1, Opponent2, Opponent3])
+    # Note: Opponents are functions or strings 'pool'
+    STAGES = [
+        ("Stage 2: 3 Min Bots", [strategies.min_policy, strategies.min_policy, strategies.min_policy]),
+        ("Stage 3: 2 Min + 1 Expert", [strategies.min_policy, strategies.min_policy, ExpertPolicy.play_policy]),
+        ("Stage 4: 1 Min + 2 Expert", [strategies.min_policy, ExpertPolicy.play_policy, ExpertPolicy.play_policy]),
+        ("Stage 5: 3 Expert", [ExpertPolicy.play_policy, ExpertPolicy.play_policy, ExpertPolicy.play_policy]),
+        ("Stage 6: 2 Expert + 1 Random", [ExpertPolicy.play_policy, ExpertPolicy.play_policy, strategies.random_policy]),
+        ("Stage 7: 2 Expert + 1 Pool", [ExpertPolicy.play_policy, ExpertPolicy.play_policy, 'pool']),
+        ("Stage 8: 1 Expert + 2 Pool", [ExpertPolicy.play_policy, 'pool', 'pool']),
+    ]
+    
+    # Stage Weights (Relative duration)
+    # S2(1), S3(2), S4(3), S5(4), S6(2), S7(4), S8(4) -> Total 20
+    STAGE_WEIGHTS = [1, 2, 3, 4, 2, 4, 4]
+    
+    if loaded_from_checkpoint:
+        # Resume from Stage 5 (Index 3)
+        start_stage_idx = 3
+        print("Resuming training: Starting from Stage 5 (3 Expert Bots)")
+    else:
+        # Start from Stage 2 (Index 0)
+        start_stage_idx = 0
+        print("Starting fresh training: Starting from Stage 2 (3 Min Bots)")
+        
+    # Calculate episodes per stage
+    active_weights = STAGE_WEIGHTS[start_stage_idx:]
+    total_weight = sum(active_weights)
+    stage_episodes = [int(TOTAL_EPISODES * (w / total_weight)) for w in active_weights]
+    
+    # Adjust last stage to match total exactly
+    stage_episodes[-1] += TOTAL_EPISODES - sum(stage_episodes)
+    
+    # Build Schedule: [(End Episode, Stage Index)]
+    schedule = []
+    current_end = start_episode
+    for i, count in enumerate(stage_episodes):
+        current_end += count
+        schedule.append((current_end, start_stage_idx + i))
+        print(f"  - {STAGES[start_stage_idx + i][0]}: {count} episodes (until ep {current_end})")
+
+    current_stage_idx = start_stage_idx
+    
+    for i_episode in range(start_episode, start_episode + TOTAL_EPISODES):
         ai_player.reset()
         for opp in opponent_agents:
             opp.reset()
@@ -443,40 +496,41 @@ def train():
         if i_episode % 50 == 0:
             pool.add(model.state_dict())
         
-        # Dynamic Difficulty Curriculum
-        progress = i_episode / EPISODES
-        difficulty = "Random"
+        # Determine Current Stage
+        # Find the first schedule item where end_episode > i_episode
+        for end_ep, stage_idx in schedule:
+            if end_ep > i_episode:
+                current_stage_idx = stage_idx
+                break
         
-        # Default Policies
-        p_policies = [strategies.random_policy] * 3
-        pass_policies = [strategies.random_pass_policy] * 3
+        stage_name, opponent_config = STAGES[current_stage_idx]
+        difficulty = stage_name
         
-        if progress < 0.3:
-            # Stage 1: Basic Heuristics (Deterministic)
-            # Start with Min/Max as they are more "logical" and easier to learn basic mechanics from.
-            difficulty = "Beginner (Heuristics)"
-            p_policies = [strategies.min_policy, strategies.min_policy, strategies.max_policy] # 2 Conservative, 1 Aggressive
-            
-        elif progress < 0.6:
-            # Stage 2: Introducing Chaos (Random)
-            # Now that we know the rules, handle unpredictable random players which can be harder.
-            difficulty = "Intermediate (Random + Heuristics)"
-            p_policies = [strategies.random_policy, strategies.min_policy, strategies.max_policy]
-            
-        else:
-            # Stage 3: Advanced (Pool + Self-Play)
-            difficulty = "Advanced (Pool + Heuristics)"
-            # Mix of Pool and Heuristics
-            for i in range(3):
-                if pool.pool and random.random() < 0.7: # 70% chance to play against past self
+        # Setup Opponents
+        p_policies = []
+        pass_policies = []
+        
+        for i, opp_type in enumerate(opponent_config):
+            if opp_type == 'pool':
+                # Play against pool
+                if pool.pool:
                     past_state = pool.sample()
                     opponent_models[i].load_state_dict(past_state)
-                    p_policies[i] = opponent_agents[i].play_policy
-                    pass_policies[i] = opponent_agents[i].pass_policy
+                    p_policies.append(opponent_agents[i].play_policy)
+                    pass_policies.append(opponent_agents[i].pass_policy)
                 else:
-                    # Fallback to heuristics/random mix
-                    p_policies[i] = random.choice([strategies.min_policy, strategies.max_policy, strategies.random_policy, ExpertPolicy.play_policy])
-                    pass_policies[i] = strategies.random_pass_policy
+                    # Fallback if pool empty
+                    p_policies.append(ExpertPolicy.play_policy)
+                    pass_policies.append(strategies.random_pass_policy)
+            else:
+                # Static Policy
+                p_policies.append(opp_type)
+                # For static policies, use random pass or expert pass?
+                # Let's use random pass for min/random, expert pass for expert
+                if opp_type == ExpertPolicy.play_policy:
+                    pass_policies.append(ExpertPolicy.pass_policy)
+                else:
+                    pass_policies.append(strategies.random_pass_policy)
 
         current_policies = [ai_player.play_policy] + p_policies
         current_pass_policies = [ai_player.pass_policy] + pass_policies
@@ -661,7 +715,7 @@ def train():
 
     print("Training Complete.")
     torch.save({
-        'epoch': start_episode + EPISODES - 1,
+        'epoch': start_episode + TOTAL_EPISODES - 1,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
     }, model_path)
