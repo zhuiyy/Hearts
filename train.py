@@ -200,10 +200,14 @@ def from_suit_int(val):
         if s.value == val:
             yield s
 
-def pretrain_supervised(model, optimizer, device, episodes=200):
+def pretrain_supervised(model, optimizer, device, episodes=1000):
     print(f"Starting Supervised Pretraining (Policy + Value) for {episodes} episodes...")
     game = GameV2()
     ai_player = AIPlayer(model, device)
+    
+    # Adaptive Learning Rate Scheduler
+    # Reduce LR if loss stops decreasing for 'patience' number of updates
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10, verbose=True)
     
     running_loss = 0.0
     running_p_loss = 0.0
@@ -333,6 +337,9 @@ def pretrain_supervised(model, optimizer, device, episodes=200):
             
             optimizer.step()
             
+            # Step Scheduler with current loss
+            scheduler.step(loss)
+            
             running_loss += loss.item()
             running_p_loss += policy_loss.item()
             running_v_loss += value_loss.item()
@@ -362,6 +369,8 @@ def train():
     
     model = HeartsTransformer(d_model=HIDDEN_DIM, dropout=DROPOUT).to(device)
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    # Add scheduler for PPO training as well to prevent oscillation
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=1000, verbose=True)
     
     start_episode = 0
     loaded_from_checkpoint = False
@@ -399,7 +408,8 @@ def train():
     
     # Pretrain if not loaded
     if not loaded_from_checkpoint:
-        pretrain_supervised(model, optimizer, device, episodes=200)
+        # Increased pretraining episodes to allow convergence and LR scheduling to work
+        pretrain_supervised(model, optimizer, device, episodes=5000)
     else:
         print("Skipping pretraining for loaded model.")
     
@@ -497,11 +507,25 @@ def train():
             pool.add(model.state_dict())
         
         # Determine Current Stage
-        # Find the first schedule item where end_episode > i_episode
+        target_stage_idx = current_stage_idx
         for end_ep, stage_idx in schedule:
             if end_ep > i_episode:
-                current_stage_idx = stage_idx
+                target_stage_idx = stage_idx
                 break
+        
+        # Check for Stage Transition
+        if target_stage_idx != current_stage_idx:
+            print(f"\n*** Curriculum Stage Transition: {STAGES[current_stage_idx][0]} -> {STAGES[target_stage_idx][0]} ***")
+            print(f"*** Resetting Learning Rate to {LEARNING_RATE} to adapt to new opponents ***")
+            
+            # Reset Learning Rate
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = LEARNING_RATE
+                
+            # Reset Scheduler
+            scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=1000, verbose=True)
+            
+            current_stage_idx = target_stage_idx
         
         stage_name, opponent_config = STAGES[current_stage_idx]
         difficulty = stage_name
@@ -707,6 +731,10 @@ def train():
         
         if i_episode % 50 == 0:
             print(f"Episode {i_episode}\tAvg Score: {running_score:.2f}\tAvg Reward: {running_reward:.2f}\tPass: {pass_dir.name}\tDiff: {difficulty}")
+            
+            # Step the scheduler based on running score (we want to minimize score)
+            scheduler.step(running_score)
+            
             torch.save({
                 'epoch': i_episode,
                 'model_state_dict': model.state_dict(),
