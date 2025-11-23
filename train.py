@@ -22,6 +22,9 @@ BATCH_SIZE = 32 # Update every 32 games
 HIDDEN_DIM = 128
 PPO_EPOCHS = 4
 CLIP_EPS = 0.2
+WEIGHT_DECAY = 1e-5 # L2 Regularization
+DROPOUT = 0.1 # Dropout probability
+MAX_GRAD_NORM = 0.5 # Gradient Clipping
 
 class OpponentPool:
     def __init__(self, max_size=50):
@@ -324,6 +327,10 @@ def pretrain_supervised(model, optimizer, device, episodes=200):
             
             optimizer.zero_grad()
             loss.backward()
+            
+            # Gradient Clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), MAX_GRAD_NORM)
+            
             optimizer.step()
             
             running_loss += loss.item()
@@ -353,8 +360,8 @@ def train():
     device = gpu_selector.select_device()
     print(f"Training on {device}")
     
-    model = HeartsTransformer(d_model=HIDDEN_DIM).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    model = HeartsTransformer(d_model=HIDDEN_DIM, dropout=DROPOUT).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     
     start_episode = 0
     loaded_from_checkpoint = False
@@ -603,6 +610,10 @@ def train():
                 
                 optimizer.zero_grad()
                 loss.backward()
+                
+                # Gradient Clipping
+                torch.nn.utils.clip_grad_norm_(model.parameters(), MAX_GRAD_NORM)
+                
                 optimizer.step()
                 
                 current_p_loss = policy_loss.item()

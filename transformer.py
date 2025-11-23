@@ -304,7 +304,7 @@ class game_stats_matrix:
 
 
 class HeartsTransformer(nn.Module):
-    def __init__(self, d_model=64, nhead=8, num_layers=6):
+    def __init__(self, d_model=64, nhead=8, num_layers=6, dropout=0.1):
         super().__init__()
         self.d_model = d_model
         self.matrix = [
@@ -331,7 +331,7 @@ class HeartsTransformer(nn.Module):
             nn.Linear(9, d_model)   # game_stats (Updated to 9)
         ])
         
-        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, batch_first=True)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, batch_first=True, dropout=dropout)
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         
         # Output head - predicting card probabilities (52 cards)
