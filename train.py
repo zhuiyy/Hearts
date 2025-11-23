@@ -16,6 +16,7 @@ import gpu_selector
 
 # Hyperparameters
 LEARNING_RATE = 1e-4
+PRETRAIN_LR = 1e-3 # Higher LR for supervised pretraining
 GAMMA = 0.99
 EPISODES = 5000
 BATCH_SIZE = 32 # Update every 32 games
@@ -200,18 +201,25 @@ def from_suit_int(val):
         if s.value == val:
             yield s
 
-def pretrain_supervised(model, optimizer, device, episodes=1000):
+def pretrain_supervised(model, device, episodes=1000):
     print(f"Starting Supervised Pretraining (Policy + Value) for {episodes} episodes...")
     game = GameV2()
     ai_player = AIPlayer(model, device)
     
+    # Create a separate optimizer for pretraining
+    # Use a smaller LR for Policy stability, but keep it separate
+    optimizer = optim.Adam(model.parameters(), lr=3e-4, weight_decay=WEIGHT_DECAY)
+    
     # Adaptive Learning Rate Scheduler
-    # Reduce LR if loss stops decreasing for 'patience' number of updates
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10, verbose=True)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=50, verbose=True)
     
     running_loss = 0.0
     running_p_loss = 0.0
     running_v_loss = 0.0
+    running_acc = 0.0
+    
+    # Use a larger batch size for pretraining to reduce variance
+    PRETRAIN_BATCH_SIZE = 128
     
     # Batch buffers
     batch_states = []
@@ -303,9 +311,14 @@ def pretrain_supervised(model, optimizer, device, episodes=1000):
         batch_masks.extend(ai_player.saved_masks)
         batch_returns.extend(returns)
         
-        # Update every BATCH_SIZE episodes
-        if (i_episode + 1) % BATCH_SIZE == 0:
+        # Update every PRETRAIN_BATCH_SIZE episodes
+        if (i_episode + 1) % PRETRAIN_BATCH_SIZE == 0:
             b_returns = torch.tensor(batch_returns).to(device)
+            
+            # Normalize returns for stability (Critical for Value Loss)
+            if len(b_returns) > 1:
+                b_returns = (b_returns - b_returns.mean()) / (b_returns.std() + 1e-9)
+            
             b_actions = torch.stack(batch_actions)
             
             # Forward pass on batch
@@ -316,16 +329,17 @@ def pretrain_supervised(model, optimizer, device, episodes=1000):
             # 1. Value Loss (MSE)
             value_loss = torch.nn.functional.mse_loss(values, b_returns)
             
-            # 2. Policy Loss (Cross Entropy / Behavior Cloning)
-            # We want to maximize log_prob of the action taken by the heuristic
-            # CrossEntropyLoss expects logits (unnormalized) and target indices
-            
-            # Apply mask to logits before CrossEntropy?
-            # CrossEntropyLoss doesn't take a mask, but we can set illegal logits to -inf
+            # 2. Policy Loss (Cross Entropy with Label Smoothing)
             masks = torch.stack(batch_masks)
             masked_logits = logits + masks
             
-            policy_loss = torch.nn.functional.cross_entropy(masked_logits, b_actions)
+            # Use label smoothing to prevent overconfidence and reduce oscillation
+            policy_loss = torch.nn.functional.cross_entropy(masked_logits, b_actions, label_smoothing=0.1)
+            
+            # Calculate Accuracy
+            with torch.no_grad():
+                pred_actions = torch.argmax(masked_logits, dim=1)
+                accuracy = (pred_actions == b_actions).float().mean()
             
             loss = policy_loss + 0.5 * value_loss
             
@@ -343,6 +357,7 @@ def pretrain_supervised(model, optimizer, device, episodes=1000):
             running_loss += loss.item()
             running_p_loss += policy_loss.item()
             running_v_loss += value_loss.item()
+            running_acc += accuracy.item()
             
             # Clear batch
             batch_states = []
@@ -351,13 +366,26 @@ def pretrain_supervised(model, optimizer, device, episodes=1000):
             batch_returns = []
         
         if (i_episode + 1) % 50 == 0:
-            avg_loss = running_loss / (50 / BATCH_SIZE)
-            avg_p = running_p_loss / (50 / BATCH_SIZE)
-            avg_v = running_v_loss / (50 / BATCH_SIZE)
-            print(f"Pretrain Episode {i_episode+1}/{episodes}\tLoss: {avg_loss:.4f} (P: {avg_p:.4f}, V: {avg_v:.4f})")
-            running_loss = 0.0
-            running_p_loss = 0.0
-            running_v_loss = 0.0
+            # Adjust logging frequency scaling
+            steps = 50 / PRETRAIN_BATCH_SIZE
+            if steps < 1: steps = 1 # Avoid division by zero if batch > 50
+            
+            # Only print if we actually updated (approximate)
+            # Or just print the running averages
+            # Since batch size is 128, we update every 128 episodes.
+            # Printing every 50 might show stale data.
+            pass
+
+        if (i_episode + 1) % PRETRAIN_BATCH_SIZE == 0:
+             avg_loss = running_loss 
+             avg_p = running_p_loss 
+             avg_v = running_v_loss 
+             avg_acc = running_acc
+             print(f"Pretrain Episode {i_episode+1}/{episodes}\tLoss: {avg_loss:.4f} (P: {avg_p:.4f}, V: {avg_v:.4f})\tAcc: {avg_acc:.2%}")
+             running_loss = 0.0
+             running_p_loss = 0.0
+             running_v_loss = 0.0
+             running_acc = 0.0
             
     print("Supervised Pretraining Complete.")
 
@@ -409,7 +437,7 @@ def train():
     # Pretrain if not loaded
     if not loaded_from_checkpoint:
         # Increased pretraining episodes to allow convergence and LR scheduling to work
-        pretrain_supervised(model, optimizer, device, episodes=5000)
+        pretrain_supervised(model, device, episodes=5000)
     else:
         print("Skipping pretraining for loaded model.")
     
