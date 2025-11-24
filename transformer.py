@@ -577,8 +577,8 @@ class HeartsTransformer(nn.Module):
         emb, mask = self.assemble_batch([raw_state], device, dtype)
         return emb.squeeze(0), mask.squeeze(0)
 
-    def forward(self, x=None, raw_state=None, batch_raw_states=None):
-        padding_mask = None
+    def forward(self, x=None, raw_state=None, batch_raw_states=None, padding_mask=None):
+        # padding_mask argument added to support pre-assembled batches
         
         # If x is not provided, assemble from internal state or provided raw_state
         if batch_raw_states is not None:

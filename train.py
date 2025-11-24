@@ -35,6 +35,7 @@ WEIGHT_DECAY = 1e-5 # L2 Regularization
 PRETRAIN_LR = 1e-4 # Lower LR for stability
 PRETRAIN_EPISODES = 5000
 PRETRAIN_BATCH_SIZE = 32 # Reduced from 128 to prevent OOM
+PRETRAIN_EPOCHS = 10 # Number of epochs per batch
 LABEL_SMOOTHING = 0.0 # MUST BE 0.0 when using Masking (-inf), otherwise Loss becomes Inf
 
 # --- DAgger (Dataset Aggregation) ---
@@ -372,59 +373,62 @@ def pretrain_supervised(model, device, episodes=PRETRAIN_EPISODES):
                 b_returns = (b_returns - b_returns.mean()) / (b_returns.std() + 1e-9)
             
             b_actions = torch.stack(batch_actions)
-            
-            # Forward pass on batch
-            logits, values = model(batch_raw_states=batch_states)
-            logits = logits.squeeze() # (Batch, 52)
-            values = values.squeeze() # (Batch)
-            
-            # 1. Value Loss (MSE)
-            value_loss = torch.nn.functional.mse_loss(values, b_returns)
-            
-            # 2. Policy Loss (Cross Entropy with Label Smoothing)
             masks = torch.stack(batch_masks)
-            masked_logits = logits + masks
             
-            # Check for NaN/Inf in logits
-            if torch.isnan(masked_logits).any() or torch.isinf(masked_logits).any():
-                # If we have infs that are NOT from the mask (mask uses -inf), we have a problem.
-                # But mask uses -inf, so isinf will be true.
-                # We need to check for positive inf or nan.
-                if torch.isnan(masked_logits).any() or (masked_logits == float('inf')).any():
-                     print("Warning: NaN or Pos Inf detected in logits!")
+            # Pre-assemble batch to save time
+            # x: (Batch, Seq_Len, Dim), padding_mask: (Batch, Seq_Len)
+            x, padding_mask = model.assemble_batch(batch_states, device=device)
             
-            # Use label smoothing to prevent overconfidence and reduce oscillation
-            # Ensure b_actions are within valid range [0, 51]
-            # And ensure the target logit is not masked out (should be impossible if data is correct)
-            
-            try:
-                policy_loss = torch.nn.functional.cross_entropy(masked_logits, b_actions, label_smoothing=LABEL_SMOOTHING)
-            except RuntimeError as e:
-                print(f"Error in CrossEntropy: {e}")
-                policy_loss = torch.tensor(0.0, device=device, requires_grad=True)
+            # Run multiple epochs on the collected batch
+            for _ in range(PRETRAIN_EPOCHS):
+                # Forward pass on batch
+                logits, values = model(x=x, padding_mask=padding_mask)
+                logits = logits.squeeze() # (Batch, 52)
+                values = values.squeeze() # (Batch)
+                
+                # 1. Value Loss (MSE)
+                value_loss = torch.nn.functional.mse_loss(values, b_returns)
+                
+                # 2. Policy Loss (Cross Entropy with Label Smoothing)
+                masked_logits = logits + masks
+                
+                # Check for NaN/Inf in logits
+                if torch.isnan(masked_logits).any() or torch.isinf(masked_logits).any():
+                    # If we have infs that are NOT from the mask (mask uses -inf), we have a problem.
+                    # But mask uses -inf, so isinf will be true.
+                    # We need to check for positive inf or nan.
+                    if torch.isnan(masked_logits).any() or (masked_logits == float('inf')).any():
+                        print("Warning: NaN or Pos Inf detected in logits!")
+                
+                try:
+                    policy_loss = torch.nn.functional.cross_entropy(masked_logits, b_actions, label_smoothing=LABEL_SMOOTHING)
+                except RuntimeError as e:
+                    print(f"Error in CrossEntropy: {e}")
+                    policy_loss = torch.tensor(0.0, device=device, requires_grad=True)
 
-            # Calculate Accuracy
-            with torch.no_grad():
-                pred_actions = torch.argmax(masked_logits, dim=1)
-                accuracy = (pred_actions == b_actions).float().mean()
+                # Calculate Accuracy
+                with torch.no_grad():
+                    pred_actions = torch.argmax(masked_logits, dim=1)
+                    accuracy = (pred_actions == b_actions).float().mean()
+                
+                # Check for Inf Loss
+                if torch.isinf(policy_loss) or torch.isnan(policy_loss):
+                    print("Warning: Policy Loss is Inf/NaN. Skipping update.")
+                    loss = torch.tensor(0.0, device=device, requires_grad=True) # Dummy loss
+                else:
+                    loss = policy_loss + VALUE_LOSS_COEF * value_loss
+                
+                optimizer.zero_grad()
+                
+                if loss.item() != 0.0:
+                    loss.backward()
+                    # Gradient Clipping
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), MAX_GRAD_NORM)
+                    optimizer.step()
+                    # Step Scheduler with current loss
+                    scheduler.step(loss)
             
-            # Check for Inf Loss
-            if torch.isinf(policy_loss) or torch.isnan(policy_loss):
-                print("Warning: Policy Loss is Inf/NaN. Skipping update.")
-                loss = torch.tensor(0.0, device=device, requires_grad=True) # Dummy loss
-            else:
-                loss = policy_loss + VALUE_LOSS_COEF * value_loss
-            
-            optimizer.zero_grad()
-            
-            if loss.item() != 0.0:
-                loss.backward()
-                # Gradient Clipping
-                torch.nn.utils.clip_grad_norm_(model.parameters(), MAX_GRAD_NORM)
-                optimizer.step()
-                # Step Scheduler with current loss
-                scheduler.step(loss)
-            
+            # Log the last epoch's metrics
             running_loss += loss.item() if not torch.isnan(loss) else 0
             running_p_loss += policy_loss.item() if not torch.isnan(policy_loss) else 0
             running_v_loss += value_loss.item() if not torch.isnan(value_loss) else 0
