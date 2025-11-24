@@ -15,17 +15,38 @@ from strategies import ExpertPolicy
 import gpu_selector
 
 # Hyperparameters
+# --- PPO Training ---
 LEARNING_RATE = 1e-4
-PRETRAIN_LR = 1e-3 # Higher LR for supervised pretraining
 GAMMA = 0.99
-EPISODES = 5000
+EPISODES = 5000 # Default total episodes if not specified
 BATCH_SIZE = 32 # Update every 32 games
-HIDDEN_DIM = 128
 PPO_EPOCHS = 4
 CLIP_EPS = 0.2
-WEIGHT_DECAY = 1e-5 # L2 Regularization
-DROPOUT = 0.1 # Dropout probability
+ENTROPY_COEF = 0.03 # Entropy regularization coefficient
+VALUE_LOSS_COEF = 0.5 # Value loss coefficient
 MAX_GRAD_NORM = 0.5 # Gradient Clipping
+
+# --- Model Architecture ---
+HIDDEN_DIM = 128
+DROPOUT = 0.1 # Dropout probability
+WEIGHT_DECAY = 1e-5 # L2 Regularization
+
+# --- Supervised Pretraining ---
+PRETRAIN_LR = 1e-4 # Lower LR for stability
+PRETRAIN_EPISODES = 5000
+PRETRAIN_BATCH_SIZE = 128
+LABEL_SMOOTHING = 0.1
+
+# --- DAgger (Dataset Aggregation) ---
+DAGGER_BETA_START = 1.0 # Start with pure teacher forcing
+DAGGER_BETA_DECAY = 0.9995 # Decay per episode
+DAGGER_BETA_MIN = 0.3 # Minimum teacher forcing ratio
+
+# --- Curriculum Learning ---
+CURRICULUM_SCORE_THRESHOLD = 6.0 # Avg score to pass a stage
+CURRICULUM_STABILITY_WINDOW = 500 # Episodes to maintain score
+MAX_STAGE_EPISODES = 3000 # Max episodes per stage before forced transition
+POOL_STAGE_DURATION = 2000 # Episodes for pool stages
 
 class OpponentPool:
     def __init__(self, max_size=50):
@@ -232,7 +253,7 @@ def from_suit_int(val):
         if s.value == val:
             yield s
 
-def pretrain_supervised(model, device, episodes=1000):
+def pretrain_supervised(model, device, episodes=PRETRAIN_EPISODES):
     print(f"Starting Supervised Pretraining (Policy + Value) for {episodes} episodes...")
     game = GameV2()
     ai_player = AIPlayer(model, device)
@@ -240,7 +261,7 @@ def pretrain_supervised(model, device, episodes=1000):
     # Create a separate optimizer for pretraining
     # Use a smaller LR for Policy stability, but keep it separate
     # Reduced LR to 1e-4 to prevent gradient explosion/inf loss
-    optimizer = optim.Adam(model.parameters(), lr=1e-4, weight_decay=WEIGHT_DECAY)
+    optimizer = optim.Adam(model.parameters(), lr=PRETRAIN_LR, weight_decay=WEIGHT_DECAY)
     
     # Adaptive Learning Rate Scheduler
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=50)
@@ -249,9 +270,6 @@ def pretrain_supervised(model, device, episodes=1000):
     running_p_loss = 0.0
     running_v_loss = 0.0
     running_acc = 0.0
-    
-    # Use a larger batch size for pretraining to reduce variance
-    PRETRAIN_BATCH_SIZE = 128
     
     # Batch buffers
     batch_states = []
@@ -262,9 +280,9 @@ def pretrain_supervised(model, device, episodes=1000):
     # DAgger Beta Schedule
     # Start with 1.0 (Pure BC) and decay to 0.5 (Mix)
     # We don't want to go to 0.0 because random exploration might be too chaotic for Value learning
-    beta = 1.0
-    beta_decay = 0.9995 # Decay per episode
-    min_beta = 0.3
+    beta = DAGGER_BETA_START
+    beta_decay = DAGGER_BETA_DECAY # Decay per episode
+    min_beta = DAGGER_BETA_MIN
     
     for i_episode in range(episodes):
         ai_player.reset()
@@ -380,7 +398,7 @@ def pretrain_supervised(model, device, episodes=1000):
             # And ensure the target logit is not masked out (should be impossible if data is correct)
             
             try:
-                policy_loss = torch.nn.functional.cross_entropy(masked_logits, b_actions, label_smoothing=0.1)
+                policy_loss = torch.nn.functional.cross_entropy(masked_logits, b_actions, label_smoothing=LABEL_SMOOTHING)
             except RuntimeError as e:
                 print(f"Error in CrossEntropy: {e}")
                 policy_loss = torch.tensor(0.0, device=device, requires_grad=True)
@@ -395,7 +413,7 @@ def pretrain_supervised(model, device, episodes=1000):
                 print("Warning: Policy Loss is Inf/NaN. Skipping update.")
                 loss = torch.tensor(0.0, device=device, requires_grad=True) # Dummy loss
             else:
-                loss = policy_loss + 0.5 * value_loss
+                loss = policy_loss + VALUE_LOSS_COEF * value_loss
             
             optimizer.zero_grad()
             
@@ -490,7 +508,7 @@ def train():
     # Pretrain if not loaded
     if not loaded_from_checkpoint:
         # Increased pretraining episodes to allow convergence and LR scheduling to work
-        pretrain_supervised(model, device, episodes=5000)
+        pretrain_supervised(model, device, episodes=PRETRAIN_EPISODES)
     else:
         print("Skipping pretraining for loaded model.")
     
@@ -566,14 +584,11 @@ def train():
     stage_episode_count = 0
     consecutive_good_epochs = 0
     
-    # Max episodes per stage (Upper limit)
-    MAX_STAGE_EPISODES = 3000
-    
     # Pool stages start index (Stage 7 is index 5)
     POOL_START_IDX = 5
     
     print(f"Starting Dynamic Curriculum Training...")
-    print(f"Transition Condition (Non-Pool Stages): Avg Score < 6.0 for 500 consecutive episodes OR Max {MAX_STAGE_EPISODES} episodes.")
+    print(f"Transition Condition (Non-Pool Stages): Avg Score < {CURRICULUM_SCORE_THRESHOLD} for {CURRICULUM_STABILITY_WINDOW} consecutive episodes OR Max {MAX_STAGE_EPISODES} episodes.")
     
     for i_episode in range(start_episode, start_episode + TOTAL_EPISODES):
         ai_player.reset()
@@ -593,20 +608,20 @@ def train():
         # Only apply dynamic logic for non-pool stages (Indices 0-4)
         if current_stage_idx < POOL_START_IDX:
             # Check performance condition
-            if running_score < 6.0:
+            if running_score < CURRICULUM_SCORE_THRESHOLD:
                 consecutive_good_epochs += 1
             else:
                 consecutive_good_epochs = 0
                 
-            if consecutive_good_epochs >= 500:
-                print(f"  -> Performance condition met: {consecutive_good_epochs} consecutive episodes with score < 6.0")
+            if consecutive_good_epochs >= CURRICULUM_STABILITY_WINDOW:
+                print(f"  -> Performance condition met: {consecutive_good_epochs} consecutive episodes with score < {CURRICULUM_SCORE_THRESHOLD}")
                 should_transition = True
             elif stage_episode_count >= MAX_STAGE_EPISODES:
                 print(f"  -> Max stage episodes reached ({MAX_STAGE_EPISODES})")
                 should_transition = True
         else:
             # For Pool stages, use a fixed duration (e.g., 2000 episodes)
-            if stage_episode_count >= 2000:
+            if stage_episode_count >= POOL_STAGE_DURATION:
                 should_transition = True
 
         # Perform Transition
@@ -782,9 +797,9 @@ def train():
                 value_loss = torch.nn.functional.mse_loss(new_values, b_returns)
                 
                 # Entropy Bonus (Increased to 0.03 to encourage exploration against tough opponents)
-                entropy_loss = -0.03 * entropies.mean()
+                entropy_loss = -ENTROPY_COEF * entropies.mean()
                 
-                loss = policy_loss + 0.5 * value_loss + entropy_loss
+                loss = policy_loss + VALUE_LOSS_COEF * value_loss + entropy_loss
                 
                 optimizer.zero_grad()
                 loss.backward()
