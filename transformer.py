@@ -263,7 +263,8 @@ class player_stats_matrix:
         for i in range(4):
             target_pid = (my_player_id + i) % 4
             player = players[target_pid]
-            self.matrix[i, 0] = player.points
+            # Normalize points: divide by 100 (soft max)
+            self.matrix[i, 0] = min(player.points / 100.0, 1.0)
             has_sq = False
             for c in player.table:
                 if c.suit == Suit.SPADES and c.rank == 12:
@@ -278,7 +279,8 @@ class player_stats_matrix:
         for i in range(4):
             target_pid = (my_player_id + i) % 4
             stats = players_stats[target_pid]
-            self.matrix[i, 0] = stats['points']
+            # Normalize points
+            self.matrix[i, 0] = min(stats['points'] / 100.0, 1.0)
             if stats['has_sq']:
                 self.matrix[i, 1] = 1.0
 
@@ -303,7 +305,8 @@ class game_stats_matrix:
 
     def update_values(self, rounds: int, heart_broken: bool, piggy_pulled: bool, pass_direction: PassDirection, is_passing: bool = False):
         self.matrix.zero_()
-        self.matrix[0, 0] = rounds
+        # Normalize rounds: 1-13 -> 0.0-1.0 approx
+        self.matrix[0, 0] = rounds / 13.0
         self.matrix[0, 1] = 1.0 if rounds == 1 else 0.0
         self.matrix[0, 2] = 1.0 if heart_broken else 0.0
         self.matrix[0, 3] = 1.0 if piggy_pulled else 0.0
