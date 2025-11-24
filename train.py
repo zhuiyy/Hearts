@@ -39,7 +39,7 @@ LABEL_SMOOTHING = 0.0 # MUST BE 0.0 when using Masking (-inf), otherwise Loss be
 
 # --- DAgger (Dataset Aggregation) ---
 DAGGER_BETA_START = 1.0 # Start with pure teacher forcing
-DAGGER_BETA_DECAY = 0.9995 # Decay per episode
+DAGGER_BETA_DECAY = 0.9998 # Decay per episode (Slower decay to stabilize training)
 DAGGER_BETA_MIN = 0.3 # Minimum teacher forcing ratio
 
 # --- Curriculum Learning ---

@@ -47,7 +47,12 @@ class hand_matrix:
 
     def update(self, hand: List[Card], legal_actions: List[Card], received_cards: List[Card]):
         self.matrix.zero_()
-        for i, card in enumerate(hand):
+        # Sort hand to ensure consistent Positional Encoding
+        # This is critical because PE adds signal based on index.
+        # If hand is unsorted, index 0 could be any card, making PE noise.
+        sorted_hand = sorted(hand)
+        
+        for i, card in enumerate(sorted_hand):
             if i >= 13: break
             # make_sense
             self.matrix[i, 0] = 1.0
