@@ -211,7 +211,7 @@ def pretrain_supervised(model, device, episodes=1000):
     optimizer = optim.Adam(model.parameters(), lr=3e-4, weight_decay=WEIGHT_DECAY)
     
     # Adaptive Learning Rate Scheduler
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=50, verbose=True)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=50)
     
     running_loss = 0.0
     running_p_loss = 0.0
@@ -398,7 +398,7 @@ def train():
     model = HeartsTransformer(d_model=HIDDEN_DIM, dropout=DROPOUT).to(device)
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     # Add scheduler for PPO training as well to prevent oscillation
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=1000, verbose=True)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=1000)
     
     start_episode = 0
     loaded_from_checkpoint = False
@@ -551,7 +551,7 @@ def train():
                 param_group['lr'] = LEARNING_RATE
                 
             # Reset Scheduler
-            scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=1000, verbose=True)
+            scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=1000)
             
             current_stage_idx = target_stage_idx
         
