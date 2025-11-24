@@ -484,46 +484,43 @@ def train():
     # Define Stages (Opponent Configurations)
     # Format: (Name, [Opponent1, Opponent2, Opponent3])
     # Note: Opponents are functions or strings 'pool'
+    # MODIFIED: Added "Random Bots" as warm-up to prevent "Expert Shock"
     STAGES = [
-        ("Stage 2: 3 Min Bots", [strategies.min_policy, strategies.min_policy, strategies.min_policy]),
+        ("Stage 2: 3 Random Bots", [strategies.random_policy, strategies.random_policy, strategies.random_policy]),
         ("Stage 3: 2 Min + 1 Expert", [strategies.min_policy, strategies.min_policy, ExpertPolicy.play_policy]),
         ("Stage 4: 1 Min + 2 Expert", [strategies.min_policy, ExpertPolicy.play_policy, ExpertPolicy.play_policy]),
         ("Stage 5: 3 Expert", [ExpertPolicy.play_policy, ExpertPolicy.play_policy, ExpertPolicy.play_policy]),
         ("Stage 6: 2 Expert + 1 Random", [ExpertPolicy.play_policy, ExpertPolicy.play_policy, strategies.random_policy]),
         ("Stage 7: 2 Expert + 1 Pool", [ExpertPolicy.play_policy, ExpertPolicy.play_policy, 'pool']),
         ("Stage 8: 1 Expert + 2 Pool", [ExpertPolicy.play_policy, 'pool', 'pool']),
+        ("Stage 9: 3 Pool", ['pool', 'pool', 'pool']),
     ]
     
     # Stage Weights (Relative duration)
-    # S2(1), S3(2), S4(3), S5(4), S6(2), S7(4), S8(4) -> Total 20
-    STAGE_WEIGHTS = [1, 2, 3, 4, 2, 4, 4]
+    STAGE_WEIGHTS = [1, 2, 3, 4, 2, 4, 4, 4]
     
     if loaded_from_checkpoint:
-        # Resume from Stage 5 (Index 3)
+        # Resume from Stage 5 (Index 3) - 3 Experts
         start_stage_idx = 3
         print("Resuming training: Starting from Stage 5 (3 Expert Bots)")
     else:
         # Start from Stage 2 (Index 0)
         start_stage_idx = 0
-        print("Starting fresh training: Starting from Stage 2 (3 Min Bots)")
+        print("Starting fresh training: Starting from Stage 2 (3 Random Bots)")
         
-    # Calculate episodes per stage
-    active_weights = STAGE_WEIGHTS[start_stage_idx:]
-    total_weight = sum(active_weights)
-    stage_episodes = [int(TOTAL_EPISODES * (w / total_weight)) for w in active_weights]
-    
-    # Adjust last stage to match total exactly
-    stage_episodes[-1] += TOTAL_EPISODES - sum(stage_episodes)
-    
-    # Build Schedule: [(End Episode, Stage Index)]
-    schedule = []
-    current_end = start_episode
-    for i, count in enumerate(stage_episodes):
-        current_end += count
-        schedule.append((current_end, start_stage_idx + i))
-        print(f"  - {STAGES[start_stage_idx + i][0]}: {count} episodes (until ep {current_end})")
-
+    # Dynamic Curriculum State
     current_stage_idx = start_stage_idx
+    stage_episode_count = 0
+    consecutive_good_epochs = 0
+    
+    # Max episodes per stage (Upper limit)
+    MAX_STAGE_EPISODES = 3000
+    
+    # Pool stages start index (Stage 7 is index 5)
+    POOL_START_IDX = 5
+    
+    print(f"Starting Dynamic Curriculum Training...")
+    print(f"Transition Condition (Non-Pool Stages): Avg Score < 6.0 for 500 consecutive episodes OR Max {MAX_STAGE_EPISODES} episodes.")
     
     for i_episode in range(start_episode, start_episode + TOTAL_EPISODES):
         ai_player.reset()
@@ -534,15 +531,35 @@ def train():
         if i_episode % 50 == 0:
             pool.add(model.state_dict())
         
-        # Determine Current Stage
-        target_stage_idx = current_stage_idx
-        for end_ep, stage_idx in schedule:
-            if end_ep > i_episode:
-                target_stage_idx = stage_idx
-                break
+        # --- Dynamic Stage Logic ---
+        stage_episode_count += 1
         
-        # Check for Stage Transition
-        if target_stage_idx != current_stage_idx:
+        # Check transition logic
+        should_transition = False
+        
+        # Only apply dynamic logic for non-pool stages (Indices 0-4)
+        if current_stage_idx < POOL_START_IDX:
+            # Check performance condition
+            if running_score < 6.0:
+                consecutive_good_epochs += 1
+            else:
+                consecutive_good_epochs = 0
+                
+            if consecutive_good_epochs >= 500:
+                print(f"  -> Performance condition met: {consecutive_good_epochs} consecutive episodes with score < 6.0")
+                should_transition = True
+            elif stage_episode_count >= MAX_STAGE_EPISODES:
+                print(f"  -> Max stage episodes reached ({MAX_STAGE_EPISODES})")
+                should_transition = True
+        else:
+            # For Pool stages, use a fixed duration (e.g., 2000 episodes)
+            if stage_episode_count >= 2000:
+                should_transition = True
+
+        # Perform Transition
+        if should_transition and current_stage_idx < len(STAGES) - 1:
+            target_stage_idx = current_stage_idx + 1
+            
             print(f"\n*** Curriculum Stage Transition: {STAGES[current_stage_idx][0]} -> {STAGES[target_stage_idx][0]} ***")
             print(f"*** Resetting Learning Rate to {LEARNING_RATE} to adapt to new opponents ***")
             
@@ -554,6 +571,8 @@ def train():
             scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=1000)
             
             current_stage_idx = target_stage_idx
+            stage_episode_count = 0
+            consecutive_good_epochs = 0
         
         stage_name, opponent_config = STAGES[current_stage_idx]
         difficulty = stage_name
@@ -709,8 +728,8 @@ def train():
                 # Value Loss
                 value_loss = torch.nn.functional.mse_loss(new_values, b_returns)
                 
-                # Entropy Bonus
-                entropy_loss = -0.01 * entropies.mean()
+                # Entropy Bonus (Increased to 0.03 to encourage exploration against tough opponents)
+                entropy_loss = -0.03 * entropies.mean()
                 
                 loss = policy_loss + 0.5 * value_loss + entropy_loss
                 
