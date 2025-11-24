@@ -27,7 +27,7 @@ VALUE_LOSS_COEF = 0.5 # Value loss coefficient
 MAX_GRAD_NORM = 0.5 # Gradient Clipping
 
 # --- Model Architecture ---
-HIDDEN_DIM = 128
+HIDDEN_DIM = 256 # Increased from 128
 DROPOUT = 0.1 # Dropout probability
 WEIGHT_DECAY = 1e-5 # L2 Regularization
 
