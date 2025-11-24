@@ -93,12 +93,10 @@ class AIPlayer:
         selected_cards = []
         
         # Get Teacher's suggestion if available
-        teacher_cards = []
+        teacher_cards_set = set()
         if teacher_policy:
-            teacher_cards = teacher_policy(player, info)
-            # Sort teacher cards to ensure deterministic order for autoregressive matching
-            # We sort by ID to be consistent
-            teacher_cards.sort(key=lambda c: c.to_id())
+            teacher_cards_list = teacher_policy(player, info)
+            teacher_cards_set = set(teacher_cards_list)
         
         # We need to select 3 cards. We do this autoregressively.
         # The model sees the hand, picks 1 card, then sees the hand minus that card, picks next, etc.
@@ -145,21 +143,22 @@ class AIPlayer:
             action_to_save_idx = student_action_idx
             
             # DAgger Logic
-            if teacher_policy and i < len(teacher_cards):
-                # Teacher's choice for this step
-                # Since order doesn't matter for the game, but matters for AR training:
-                # We just pick the i-th card from the sorted teacher list.
-                # This forces the model to learn to output them in ID order? 
-                # Or we could check if the student's choice is IN the teacher's set.
-                # But for CrossEntropy we need a single target.
-                # So let's enforce the sorted order.
-                teacher_card = teacher_cards[i]
-                teacher_action_idx = torch.tensor(teacher_card.to_id(), device=self.device)
+            if teacher_policy:
+                # Teacher wants to pass cards in teacher_cards_set.
+                # We need to pick one that is in current_hand.
+                # To be deterministic and consistent with "sorted by ID" logic:
+                available_teacher_cards = sorted(
+                    [c for c in teacher_cards_set if c in current_hand],
+                    key=lambda c: c.to_id()
+                )
                 
-                action_to_save_idx = teacher_action_idx
-                
-                if random.random() < beta:
-                    action_to_play_idx = teacher_action_idx
+                if available_teacher_cards:
+                    teacher_card = available_teacher_cards[0]
+                    teacher_action_idx = torch.tensor(teacher_card.to_id(), device=self.device)
+                    action_to_save_idx = teacher_action_idx
+                    
+                    if random.random() < beta:
+                        action_to_play_idx = teacher_action_idx
             
             # 5. Save log prob and value for training
             # We save log_prob of the PLAYED action
