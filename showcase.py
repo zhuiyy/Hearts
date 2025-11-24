@@ -116,8 +116,8 @@ def run_showcase():
     policies = [
         ai_play_wrapper,
         strategies.ExpertPolicy.play_policy,
-        strategies.random_policy,
-        strategies.min_policy
+        strategies.ExpertPolicy.play_policy,
+        strategies.ExpertPolicy.play_policy
     ]
     
     first_player = game.gamestate.get_first_player()
@@ -136,9 +136,9 @@ def run_showcase():
     print("\n" + "="*50)
     print(" FINAL SCORES ")
     print(f" AI Agent: {scores[0]}")
-    print(f" Expert:   {scores[1]}")
-    print(f" Random:   {scores[2]}")
-    print(f" Min:      {scores[3]}")
+    print(f" Expert1: {scores[1]}")
+    print(f" Expert2: {scores[2]}")
+    print(f" Expert3: {scores[3]}")
     print("="*50 + "\n")
 
 if __name__ == "__main__":
