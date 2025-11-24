@@ -350,6 +350,10 @@ class HeartsTransformer(nn.Module):
         # [CLS] Token
         self.cls_token = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
         
+        # Segment Embeddings (To distinguish Hand, Table, History, etc.)
+        # 0: Hand, 1: Current Table, 2: History, 3: Hidden, 4: P_Stats, 5: G_Stats, 6: CLS
+        self.segment_embeddings = nn.Embedding(7, d_model)
+        
         # Positional Encoding
         self.pos_encoder = PositionalEncoding(d_model, dropout)
         
@@ -453,14 +457,15 @@ class HeartsTransformer(nn.Module):
     
     def assemble_batch(self, batch_raw_states, device=None, dtype=torch.float32):
         """
-        Assemble a batch of raw states into a single tensor.
+        Assemble a batch of raw states into a single tensor AND generate padding mask.
         batch_raw_states: List[List[Tensor]]
-        Returns: (Batch, Seq_Len, d_model)
+        Returns: 
+            embeddings: (Batch, Seq_Len, d_model)
+            padding_mask: (Batch, Seq_Len) - True for padded (ignored) positions
         """
         if device is None:
             device = next(self.parameters()).device
             
-        # Transpose list of lists: [[m1, m2...], [m1, m2...]] -> [[m1, m1...], [m2, m2...]]
         num_matrices = len(self.matrix)
         batched_sources = [[] for _ in range(num_matrices)]
         
@@ -468,50 +473,106 @@ class HeartsTransformer(nn.Module):
             for i, m in enumerate(state):
                 batched_sources[i].append(m)
                 
-        embeddings = []
+        embeddings_list = []
+        mask_list = []
+        
+        # Segment IDs for each matrix type
+        # Hand(0), Table(1), History(2), Hidden(3), PStats(4), GStats(5)
+        
         for i, matrix_list in enumerate(batched_sources):
-            # Optimization: Stack on CPU first, then move to GPU
-            # This avoids creating thousands of small tensors on GPU and reduces fragmentation
-            # Assuming m is on CPU (which it should be from get_raw_state)
-            
-            # Check first element to see if it's already on device
+            # Stack: (Batch, Rows, Cols)
             if matrix_list and matrix_list[0].device != device:
                  stacked = torch.stack(matrix_list).to(device=device, dtype=dtype)
             else:
                  stacked = torch.stack([m.to(device=device, dtype=dtype) for m in matrix_list])
             
+            # Generate Mask based on "make_sense" column (index 0)
+            # If index 0 is 1.0, it's valid. If 0.0, it's padding.
+            # Note: PlayerStats and GameStats might not have "make_sense" at index 0 in the same way?
+            # Let's check:
+            # Hand: idx 0 is make_sense.
+            # CurrentTable: idx 0 is make_sense.
+            # History: idx 0 is make_sense.
+            # Hidden: idx 0 is make_sense.
+            # PlayerStats: idx 0 is points. It's always valid (4 rows).
+            # GameStats: idx 0 is rounds. It's always valid (1 row).
+            
+            batch_size, rows, _ = stacked.shape
+            
+            if i < 4: # Hand, Table, History, Hidden have make_sense at 0
+                # valid = 1.0, padding = 0.0
+                # mask should be True for padding
+                is_padding = (stacked[:, :, 0] == 0.0)
+            else:
+                # PlayerStats and GameStats are always valid
+                is_padding = torch.zeros((batch_size, rows), dtype=torch.bool, device=device)
+            
+            mask_list.append(is_padding)
+            
             # Project: (Batch, Rows, d_model)
             proj = self.input_projections[i](stacked)
-            embeddings.append(proj)
             
-        # Concatenate along sequence dimension (dim 1)
-        return torch.cat(embeddings, dim=1)
+            # Add Segment Embedding
+            seg_emb = self.segment_embeddings(torch.tensor(i, device=device)) # (d_model)
+            proj = proj + seg_emb # Broadcast add
+            
+            embeddings_list.append(proj)
+            
+        # Concatenate embeddings: (Batch, Total_Seq_Len, d_model)
+        final_embeddings = torch.cat(embeddings_list, dim=1)
+        
+        # Concatenate masks: (Batch, Total_Seq_Len)
+        final_mask = torch.cat(mask_list, dim=1)
+        
+        return final_embeddings, final_mask
+
+    def assemble_input(self, raw_state=None, device=None, dtype=torch.float32):
+        # Helper for single input (inference)
+        # We can just wrap it in a list and use assemble_batch
+        if raw_state is None:
+            raw_state = [m.matrix for m in self.matrix]
+        
+        emb, mask = self.assemble_batch([raw_state], device, dtype)
+        return emb.squeeze(0), mask.squeeze(0)
 
     def forward(self, x=None, raw_state=None, batch_raw_states=None):
+        padding_mask = None
+        
         # If x is not provided, assemble from internal state or provided raw_state
         if batch_raw_states is not None:
-            x = self.assemble_batch(batch_raw_states)
+            x, padding_mask = self.assemble_batch(batch_raw_states)
             # x is (Batch, Seq_Len, Dim)
         elif x is None:
-            x = self.assemble_input(raw_state=raw_state)
+            x, padding_mask = self.assemble_input(raw_state=raw_state)
             # x is (Seq_Len, Dim) -> unsqueeze -> (1, Seq_Len, Dim)
             x = x.unsqueeze(0)
+            padding_mask = padding_mask.unsqueeze(0)
             
         # Prepend [CLS] token
         batch_size = x.size(0)
-        # Expand cls_token to match batch size: (Batch, 1, Dim)
-        cls_tokens = self.cls_token.expand(batch_size, -1, -1)
+        
+        # CLS Token Embedding + Segment Embedding (ID 6)
+        cls_base = self.cls_token.expand(batch_size, -1, -1)
+        cls_seg = self.segment_embeddings(torch.tensor(6, device=x.device))
+        cls_tokens = cls_base + cls_seg
+        
         # Concatenate: (Batch, 1 + Seq_Len, Dim)
         x = torch.cat((cls_tokens, x), dim=1)
+        
+        # Update Padding Mask for CLS token
+        # CLS is never padding (False)
+        cls_mask = torch.zeros((batch_size, 1), dtype=torch.bool, device=x.device)
+        if padding_mask is not None:
+            padding_mask = torch.cat((cls_mask, padding_mask), dim=1)
         
         # Add Positional Encoding
         x = self.pos_encoder(x)
             
-        output = self.transformer_encoder(x)
+        # Pass src_key_padding_mask to encoder
+        # shape: (Batch, Seq_Len)
+        output = self.transformer_encoder(x, src_key_padding_mask=padding_mask)
         
-        # Use [CLS] token output (index 0) as the pooled representation
-        # This allows the model to learn how to aggregate info via attention
-        # instead of a blind mean pooling.
+        # Use [CLS] token output (index 0)
         pooled = output[:, 0, :] 
         
         logits = self.output_head(pooled)
