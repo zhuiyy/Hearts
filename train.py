@@ -34,7 +34,7 @@ WEIGHT_DECAY = 1e-5 # L2 Regularization
 # --- Supervised Pretraining ---
 PRETRAIN_LR = 1e-4 # Lower LR for stability
 PRETRAIN_EPISODES = 5000
-PRETRAIN_BATCH_SIZE = 32 # Reduced from 128 to prevent OOM
+PRETRAIN_BATCH_SIZE = 64 # Increased from 32
 PRETRAIN_EPOCHS = 10 # Number of epochs per batch
 LABEL_SMOOTHING = 0.0 # MUST BE 0.0 when using Masking (-inf), otherwise Loss becomes Inf
 
@@ -88,15 +88,23 @@ class AIPlayer:
         self.received_cards = []
         self.hand_before_pass = set()
 
-    def pass_policy(self, player, info) -> List[Card]:
+    def pass_policy(self, player, info, teacher_policy=None, beta=1.0) -> List[Card]:
         self.hand_before_pass = set(player.hand)
         selected_cards = []
+        
+        # Get Teacher's suggestion if available
+        teacher_cards = []
+        if teacher_policy:
+            teacher_cards = teacher_policy(player, info)
+            # Sort teacher cards to ensure deterministic order for autoregressive matching
+            # We sort by ID to be consistent
+            teacher_cards.sort(key=lambda c: c.to_id())
         
         # We need to select 3 cards. We do this autoregressively.
         # The model sees the hand, picks 1 card, then sees the hand minus that card, picks next, etc.
         current_hand = list(player.hand)
         
-        for _ in range(3):
+        for i in range(3):
             # 1. Update Model State with current temporary hand
             # We pass current_hand as legal_actions because we can pass any card we hold
             temp_info = info.copy()
@@ -129,16 +137,40 @@ class AIPlayer:
             # 4. Sample action
             probs = torch.softmax(masked_logits, dim=0)
             dist = torch.distributions.Categorical(probs)
-            action_idx = dist.sample()
+            
+            # Default: Student plays
+            student_action_idx = dist.sample()
+            
+            action_to_play_idx = student_action_idx
+            action_to_save_idx = student_action_idx
+            
+            # DAgger Logic
+            if teacher_policy and i < len(teacher_cards):
+                # Teacher's choice for this step
+                # Since order doesn't matter for the game, but matters for AR training:
+                # We just pick the i-th card from the sorted teacher list.
+                # This forces the model to learn to output them in ID order? 
+                # Or we could check if the student's choice is IN the teacher's set.
+                # But for CrossEntropy we need a single target.
+                # So let's enforce the sorted order.
+                teacher_card = teacher_cards[i]
+                teacher_action_idx = torch.tensor(teacher_card.to_id(), device=self.device)
+                
+                action_to_save_idx = teacher_action_idx
+                
+                if random.random() < beta:
+                    action_to_play_idx = teacher_action_idx
             
             # 5. Save log prob and value for training
-            self.saved_log_probs.append(dist.log_prob(action_idx))
+            # We save log_prob of the PLAYED action
+            self.saved_log_probs.append(dist.log_prob(action_to_play_idx))
             self.saved_values.append(value)
-            self.saved_actions.append(action_idx)
+            self.saved_actions.append(action_to_save_idx) # Target
             
             # 6. Decode card
-            suit_val = action_idx.item() // 13
-            rank_val = (action_idx.item() % 13) + 1
+            action_idx_val = action_to_play_idx.item()
+            suit_val = action_idx_val // 13
+            rank_val = (action_idx_val % 13) + 1
             
             # Find the actual card object
             selected_card = next(c for c in current_hand if c.suit.value == suit_val and c.rank == rank_val)
@@ -300,7 +332,15 @@ def pretrain_supervised(model, device, episodes=PRETRAIN_EPISODES):
         p3_policy = random.choice([strategies.min_policy, strategies.max_policy, strategies.random_policy, ExpertPolicy.play_policy])
         
         # Pass policies
-        pass_policies = [strategies.random_pass_policy] * 4
+        # Wrapper to inject heuristic into AIPlayer pass_policy using DAgger logic
+        def shadow_pass_policy(player, info):
+            return ai_player.pass_policy(
+                player, info,
+                teacher_policy=ExpertPolicy.pass_policy,
+                beta=beta
+            )
+            
+        pass_policies = [shadow_pass_policy, strategies.random_pass_policy, strategies.random_pass_policy, strategies.random_pass_policy]
         
         # Wrapper to inject heuristic into AIPlayer using DAgger logic
         def shadow_policy(player, info, legal_actions, order):
@@ -452,11 +492,12 @@ def pretrain_supervised(model, device, episodes=PRETRAIN_EPISODES):
             pass
 
         if (i_episode + 1) % PRETRAIN_BATCH_SIZE == 0:
-             avg_loss = running_loss 
-             avg_p = running_p_loss 
-             avg_v = running_v_loss 
-             avg_acc = running_acc
-             print(f"Pretrain Episode {i_episode+1}/{episodes}\tLoss: {avg_loss:.4f} (P: {avg_p:.4f}, V: {avg_v:.4f})\tAcc: {avg_acc:.2%}\tBeta: {beta:.2f}")
+             avg_loss = running_loss / PRETRAIN_EPOCHS
+             avg_p = running_p_loss / PRETRAIN_EPOCHS
+             avg_v = running_v_loss / PRETRAIN_EPOCHS
+             avg_acc = running_acc / PRETRAIN_EPOCHS
+             current_lr = optimizer.param_groups[0]['lr']
+             print(f"Pretrain Episode {i_episode+1}/{episodes}\tLoss: {avg_loss:.4f} (P: {avg_p:.4f}, V: {avg_v:.4f})\tAcc: {avg_acc:.2%}\tBeta: {beta:.2f}\tLR: {current_lr:.2e}")
              running_loss = 0.0
              running_p_loss = 0.0
              running_v_loss = 0.0
