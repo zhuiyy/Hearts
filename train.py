@@ -466,12 +466,12 @@ def pretrain_supervised(model, device, episodes=PRETRAIN_EPISODES):
                     optimizer.step()
                     # Step Scheduler with current loss
                     scheduler.step(loss)
-            
-            # Log the last epoch's metrics
-            running_loss += loss.item() if not torch.isnan(loss) else 0
-            running_p_loss += policy_loss.item() if not torch.isnan(policy_loss) else 0
-            running_v_loss += value_loss.item() if not torch.isnan(value_loss) else 0
-            running_acc += accuracy.item()
+                
+                # Log metrics for each epoch
+                running_loss += loss.item() if not torch.isnan(loss) else 0
+                running_p_loss += policy_loss.item() if not torch.isnan(policy_loss) else 0
+                running_v_loss += value_loss.item() if not torch.isnan(value_loss) else 0
+                running_acc += accuracy.item()
             
             # Clear batch
             batch_states = []
