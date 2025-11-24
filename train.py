@@ -415,12 +415,12 @@ def pretrain_supervised(model, device, episodes=PRETRAIN_EPISODES):
             b_actions = torch.stack(batch_actions)
             masks = torch.stack(batch_masks)
             
-            # Pre-assemble batch to save time
-            # x: (Batch, Seq_Len, Dim), padding_mask: (Batch, Seq_Len)
-            x, padding_mask = model.assemble_batch(batch_states, device=device)
-            
             # Run multiple epochs on the collected batch
             for _ in range(PRETRAIN_EPOCHS):
+                # Re-assemble batch each time because it involves model parameters (embeddings/projections)
+                # that need to be part of the graph for backprop
+                x, padding_mask = model.assemble_batch(batch_states, device=device)
+                
                 # Forward pass on batch
                 logits, values = model(x=x, padding_mask=padding_mask)
                 logits = logits.squeeze() # (Batch, 52)
