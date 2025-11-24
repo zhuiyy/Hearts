@@ -362,6 +362,10 @@ class HeartsTransformer(nn.Module):
         # 0: Hand, 1: Current Table, 2: History, 3: Hidden, 4: P_Stats, 5: G_Stats, 6: CLS
         self.segment_embeddings = nn.Embedding(7, d_model)
         
+        # Shared Card Embeddings (52 cards + 1 padding/none)
+        # This helps the model recognize "Ace of Spades" across Hand, Table, and History
+        self.card_embedding = nn.Embedding(53, d_model)
+        
         # Positional Encoding
         self.pos_encoder = PositionalEncoding(d_model, dropout)
         
@@ -523,6 +527,36 @@ class HeartsTransformer(nn.Module):
             # Add Segment Embedding
             seg_emb = self.segment_embeddings(torch.tensor(i, device=device)) # (d_model)
             proj = proj + seg_emb # Broadcast add
+            
+            # Add Shared Card Embedding
+            # We need to extract Card IDs from the One-Hot features
+            # ID 52 is for Padding/Non-Card rows
+            
+            batch_indices = torch.full((batch_size, rows), 52, dtype=torch.long, device=device)
+            
+            # Only process if not Stats matrices (indices 4, 5)
+            if i < 4:
+                # Check validity (make_sense == 1.0)
+                valid_mask = (stacked[:, :, 0] == 1.0)
+                
+                if i == 0 or i == 3: # Hand or Hidden: Suit at 1, Rank at 5
+                    # Suit: indices 1-4 (argmax gives 0-3)
+                    suits = stacked[:, :, 1:5].argmax(dim=2)
+                    # Rank: indices 5-17 (argmax gives 0-12)
+                    ranks = stacked[:, :, 5:18].argmax(dim=2)
+                    ids = suits * 13 + ranks
+                    batch_indices[valid_mask] = ids[valid_mask]
+                    
+                elif i == 1 or i == 2: # Table or History: Suit at 5, Rank at 9
+                    # Suit: indices 5-8
+                    suits = stacked[:, :, 5:9].argmax(dim=2)
+                    # Rank: indices 9-21
+                    ranks = stacked[:, :, 9:22].argmax(dim=2)
+                    ids = suits * 13 + ranks
+                    batch_indices[valid_mask] = ids[valid_mask]
+            
+            card_emb = self.card_embedding(batch_indices) # (Batch, Rows, d_model)
+            proj = proj + card_emb
             
             embeddings_list.append(proj)
             
