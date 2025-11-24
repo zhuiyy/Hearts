@@ -448,8 +448,15 @@ class HeartsTransformer(nn.Module):
                 
         embeddings = []
         for i, matrix_list in enumerate(batched_sources):
-            # Stack: (Batch, Rows, Cols)
-            stacked = torch.stack([m.to(device=device, dtype=dtype) for m in matrix_list])
+            # Optimization: Stack on CPU first, then move to GPU
+            # This avoids creating thousands of small tensors on GPU and reduces fragmentation
+            # Assuming m is on CPU (which it should be from get_raw_state)
+            
+            # Check first element to see if it's already on device
+            if matrix_list and matrix_list[0].device != device:
+                 stacked = torch.stack(matrix_list).to(device=device, dtype=dtype)
+            else:
+                 stacked = torch.stack([m.to(device=device, dtype=dtype) for m in matrix_list])
             
             # Project: (Batch, Rows, d_model)
             proj = self.input_projections[i](stacked)

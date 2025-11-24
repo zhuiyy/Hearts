@@ -34,7 +34,7 @@ WEIGHT_DECAY = 1e-5 # L2 Regularization
 # --- Supervised Pretraining ---
 PRETRAIN_LR = 1e-4 # Lower LR for stability
 PRETRAIN_EPISODES = 5000
-PRETRAIN_BATCH_SIZE = 128
+PRETRAIN_BATCH_SIZE = 32 # Reduced from 128 to prevent OOM
 LABEL_SMOOTHING = 0.1
 
 # --- DAgger (Dataset Aggregation) ---
