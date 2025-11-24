@@ -127,7 +127,7 @@ class AIPlayer:
         self.passed_cards = selected_cards
         return selected_cards
 
-    def play_policy(self, player, info, legal_actions, order, override_policy=None):
+    def play_policy(self, player, info, legal_actions, order, override_policy=None, teacher_policy=None, beta=1.0):
         # Deduce received cards if not already done and we passed cards
         if not self.received_cards and self.passed_cards:
              remaining = self.hand_before_pass - set(self.passed_cards)
@@ -171,28 +171,59 @@ class AIPlayer:
         # Sample action
         dist = torch.distributions.Categorical(probs)
         
+        # Determine Action to Play and Action to Save (Label)
+        
+        # Default: Student plays, Student is label
+        student_action_idx = dist.sample()
+        
+        # Convert index back to Card
+        suit_val = student_action_idx.item() // 13
+        rank_val = (student_action_idx.item() % 13) + 1
+        student_card = Card(suit=list(from_suit_int(suit_val))[0], rank=rank_val)
+        
+        action_to_play = student_card
+        action_to_save = student_action_idx
+        
         if override_policy:
-            # Use the override policy to select a card
+            # Pure Override (e.g. for pure BC or debugging)
             selected_card = override_policy(player, info, legal_actions, order)
-            # Find the index of this card to store it as the "action taken"
-            # This is important if we want to do Behavior Cloning later, 
-            # but for Value Pretraining we just need the trajectory to be valid.
-            # We still store it so the PPO loop structure doesn't break (though we won't use it for policy update in pretrain)
-            action_idx = torch.tensor(selected_card.to_id(), device=self.device)
-        else:
-            action_idx = dist.sample()
-            # Convert index back to Card
-            # 0..51 -> Suit * 13 + (Rank-1)
-            suit_val = action_idx.item() // 13
-            rank_val = (action_idx.item() % 13) + 1
-            selected_card = Card(suit=list(from_suit_int(suit_val))[0], rank=rank_val)
-        
+            action_to_play = selected_card
+            action_to_save = torch.tensor(selected_card.to_id(), device=self.device)
+            
+        elif teacher_policy:
+            # DAgger / Teacher Forcing Logic
+            # 1. Get Teacher Action
+            teacher_card = teacher_policy(player, info, legal_actions, order)
+            teacher_action_idx = torch.tensor(teacher_card.to_id(), device=self.device)
+            
+            # 2. Set Label to Teacher Action (Always train to imitate teacher)
+            action_to_save = teacher_action_idx
+            
+            # 3. Decide who plays based on Beta
+            # Beta = 1.0 -> Teacher plays (Pure BC)
+            # Beta = 0.0 -> Student plays (Pure DAgger)
+            if random.random() < beta:
+                action_to_play = teacher_card
+            else:
+                action_to_play = student_card
+
         # Save log prob and value
-        self.saved_log_probs.append(dist.log_prob(action_idx))
-        self.saved_values.append(value)
-        self.saved_actions.append(action_idx)
+        # Note: We save log_prob of the SAVED action (Target), or the PLAYED action?
+        # For PPO, we need log_prob of PLAYED action.
+        # For Supervised, we don't use log_prob, we use CrossEntropy(logits, saved_action).
+        # So let's save log_prob of PLAYED action to be safe/consistent, 
+        # but saved_actions will contain the LABEL.
+        # WAIT: If we use saved_actions for PPO later, it must match the trajectory!
+        # But pretrain_supervised doesn't use PPO. It uses custom loop.
+        # So for pretrain, saved_actions = LABEL is fine.
+        # But we must ensure we don't run PPO update on this buffer if it's mixed.
+        # pretrain_supervised has its own update loop, so it's fine.
         
-        return selected_card
+        self.saved_log_probs.append(dist.log_prob(torch.tensor(action_to_play.to_id(), device=self.device)))
+        self.saved_values.append(value)
+        self.saved_actions.append(action_to_save) # <--- This is the Target for CrossEntropy
+        
+        return action_to_play
 
 def from_suit_int(val):
     # Helper to get Suit enum from int
@@ -208,7 +239,8 @@ def pretrain_supervised(model, device, episodes=1000):
     
     # Create a separate optimizer for pretraining
     # Use a smaller LR for Policy stability, but keep it separate
-    optimizer = optim.Adam(model.parameters(), lr=3e-4, weight_decay=WEIGHT_DECAY)
+    # Reduced LR to 1e-4 to prevent gradient explosion/inf loss
+    optimizer = optim.Adam(model.parameters(), lr=1e-4, weight_decay=WEIGHT_DECAY)
     
     # Adaptive Learning Rate Scheduler
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=50)
@@ -227,8 +259,18 @@ def pretrain_supervised(model, device, episodes=1000):
     batch_masks = []
     batch_returns = []
     
+    # DAgger Beta Schedule
+    # Start with 1.0 (Pure BC) and decay to 0.5 (Mix)
+    # We don't want to go to 0.0 because random exploration might be too chaotic for Value learning
+    beta = 1.0
+    beta_decay = 0.9995 # Decay per episode
+    min_beta = 0.3
+    
     for i_episode in range(episodes):
         ai_player.reset()
+        
+        # Update Beta
+        beta = max(min_beta, beta * beta_decay)
         
         # Use Expert Policy as the teacher
         main_heuristic = ExpertPolicy.play_policy
@@ -239,24 +281,16 @@ def pretrain_supervised(model, device, episodes=1000):
         p3_policy = random.choice([strategies.min_policy, strategies.max_policy, strategies.random_policy, ExpertPolicy.play_policy])
         
         # Pass policies
-        # Use Expert Pass Policy for the main player to learn passing too!
-        # But our AIPlayer.pass_policy logic is autoregressive and complex to override directly with a simple function 
-        # that returns 3 cards at once.
-        # For now, let's focus on playing policy cloning. 
-        # If we want to clone passing, we need to adapt the shadow_pass_policy to return cards one by one or 
-        # force the AIPlayer to record the expert's choice.
-        
-        # Let's stick to random pass for opponents, but for the main player we want to learn expert passing?
-        # The current AIPlayer structure records actions one by one. 
-        # ExpertPolicy.pass_policy returns 3 cards.
-        # We can make a wrapper to feed them one by one?
-        # Or just ignore passing pretraining for now and focus on play.
-        # Let's use random pass for now to keep it simple, or implement a shadow pass later.
         pass_policies = [strategies.random_pass_policy] * 4
         
-        # Wrapper to inject heuristic into AIPlayer
+        # Wrapper to inject heuristic into AIPlayer using DAgger logic
         def shadow_policy(player, info, legal_actions, order):
-            return ai_player.play_policy(player, info, legal_actions, order, override_policy=main_heuristic)
+            return ai_player.play_policy(
+                player, info, legal_actions, order, 
+                override_policy=None, 
+                teacher_policy=main_heuristic,
+                beta=beta
+            )
             
         current_policies = [shadow_policy, p1_policy, p2_policy, p3_policy]
         
@@ -333,30 +367,49 @@ def pretrain_supervised(model, device, episodes=1000):
             masks = torch.stack(batch_masks)
             masked_logits = logits + masks
             
-            # Use label smoothing to prevent overconfidence and reduce oscillation
-            policy_loss = torch.nn.functional.cross_entropy(masked_logits, b_actions, label_smoothing=0.1)
+            # Check for NaN/Inf in logits
+            if torch.isnan(masked_logits).any() or torch.isinf(masked_logits).any():
+                # If we have infs that are NOT from the mask (mask uses -inf), we have a problem.
+                # But mask uses -inf, so isinf will be true.
+                # We need to check for positive inf or nan.
+                if torch.isnan(masked_logits).any() or (masked_logits == float('inf')).any():
+                     print("Warning: NaN or Pos Inf detected in logits!")
             
+            # Use label smoothing to prevent overconfidence and reduce oscillation
+            # Ensure b_actions are within valid range [0, 51]
+            # And ensure the target logit is not masked out (should be impossible if data is correct)
+            
+            try:
+                policy_loss = torch.nn.functional.cross_entropy(masked_logits, b_actions, label_smoothing=0.1)
+            except RuntimeError as e:
+                print(f"Error in CrossEntropy: {e}")
+                policy_loss = torch.tensor(0.0, device=device, requires_grad=True)
+
             # Calculate Accuracy
             with torch.no_grad():
                 pred_actions = torch.argmax(masked_logits, dim=1)
                 accuracy = (pred_actions == b_actions).float().mean()
             
-            loss = policy_loss + 0.5 * value_loss
+            # Check for Inf Loss
+            if torch.isinf(policy_loss) or torch.isnan(policy_loss):
+                print("Warning: Policy Loss is Inf/NaN. Skipping update.")
+                loss = torch.tensor(0.0, device=device, requires_grad=True) # Dummy loss
+            else:
+                loss = policy_loss + 0.5 * value_loss
             
             optimizer.zero_grad()
-            loss.backward()
             
-            # Gradient Clipping
-            torch.nn.utils.clip_grad_norm_(model.parameters(), MAX_GRAD_NORM)
+            if loss.item() != 0.0:
+                loss.backward()
+                # Gradient Clipping
+                torch.nn.utils.clip_grad_norm_(model.parameters(), MAX_GRAD_NORM)
+                optimizer.step()
+                # Step Scheduler with current loss
+                scheduler.step(loss)
             
-            optimizer.step()
-            
-            # Step Scheduler with current loss
-            scheduler.step(loss)
-            
-            running_loss += loss.item()
-            running_p_loss += policy_loss.item()
-            running_v_loss += value_loss.item()
+            running_loss += loss.item() if not torch.isnan(loss) else 0
+            running_p_loss += policy_loss.item() if not torch.isnan(policy_loss) else 0
+            running_v_loss += value_loss.item() if not torch.isnan(value_loss) else 0
             running_acc += accuracy.item()
             
             # Clear batch
@@ -381,7 +434,7 @@ def pretrain_supervised(model, device, episodes=1000):
              avg_p = running_p_loss 
              avg_v = running_v_loss 
              avg_acc = running_acc
-             print(f"Pretrain Episode {i_episode+1}/{episodes}\tLoss: {avg_loss:.4f} (P: {avg_p:.4f}, V: {avg_v:.4f})\tAcc: {avg_acc:.2%}")
+             print(f"Pretrain Episode {i_episode+1}/{episodes}\tLoss: {avg_loss:.4f} (P: {avg_p:.4f}, V: {avg_v:.4f})\tAcc: {avg_acc:.2%}\tBeta: {beta:.2f}")
              running_loss = 0.0
              running_p_loss = 0.0
              running_v_loss = 0.0
