@@ -331,6 +331,10 @@ class HeartsTransformer(nn.Module):
             nn.Linear(9, d_model)   # game_stats (Updated to 9)
         ])
         
+        # [CLS] Token: A learnable parameter to aggregate global information
+        # Shape: (1, 1, d_model)
+        self.cls_token = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+        
         encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, batch_first=True, dropout=dropout)
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         
@@ -475,14 +479,19 @@ class HeartsTransformer(nn.Module):
             # x is (Seq_Len, Dim) -> unsqueeze -> (1, Seq_Len, Dim)
             x = x.unsqueeze(0)
             
+        # Prepend [CLS] token
+        batch_size = x.size(0)
+        # Expand cls_token to match batch size: (Batch, 1, Dim)
+        cls_tokens = self.cls_token.expand(batch_size, -1, -1)
+        # Concatenate: (Batch, 1 + Seq_Len, Dim)
+        x = torch.cat((cls_tokens, x), dim=1)
+            
         output = self.transformer_encoder(x)
         
-        # We might want to pool or take specific token outputs
-        # For now, let's take the mean or the last token?
-        # Or maybe we want a specific "action" token?
-        # Let's take the mean for now
-        # With batch_first=True, output is (Batch, Seq_Len, Dim), so mean over dim 1
-        pooled = output.mean(dim=1) 
+        # Use [CLS] token output (index 0) as the pooled representation
+        # This allows the model to learn how to aggregate info via attention
+        # instead of a blind mean pooling.
+        pooled = output[:, 0, :] 
         
         logits = self.output_head(pooled)
         value = self.value_head(pooled)
