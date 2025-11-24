@@ -35,7 +35,7 @@ WEIGHT_DECAY = 1e-5 # L2 Regularization
 PRETRAIN_LR = 1e-4 # Lower LR for stability
 PRETRAIN_EPISODES = 5000
 PRETRAIN_BATCH_SIZE = 32 # Reduced from 128 to prevent OOM
-LABEL_SMOOTHING = 0.1
+LABEL_SMOOTHING = 0.0 # MUST BE 0.0 when using Masking (-inf), otherwise Loss becomes Inf
 
 # --- DAgger (Dataset Aggregation) ---
 DAGGER_BETA_START = 1.0 # Start with pure teacher forcing
