@@ -19,10 +19,11 @@ import gpu_selector
 LEARNING_RATE = 1e-4
 GAMMA = 0.99
 EPISODES = 5000 # Default total episodes if not specified
-BATCH_SIZE = 32 # Update every 32 games
-PPO_EPOCHS = 4
+BATCH_SIZE = 64 # Increased from 32 for stability
+PPO_EPOCHS = 10 # Increased from 4 for better convergence per batch
 CLIP_EPS = 0.2
-ENTROPY_COEF = 0.03 # Entropy regularization coefficient
+ENTROPY_COEF_START = 0.03 # Start high for exploration
+ENTROPY_COEF_END = 0.005 # End low for precision
 VALUE_LOSS_COEF = 0.5 # Value loss coefficient
 MAX_GRAD_NORM = 0.5 # Gradient Clipping
 
@@ -749,7 +750,14 @@ def train():
                 
                 if points_taken > 0:
                     # We took points -> Penalty
+                    # Stronger penalty for Queen of Spades (13 points)
+                    # Normal points: -0.01 per point
+                    # Queen: -0.13 normally. Let's add extra penalty.
                     r = -float(points_taken) / 100.0
+                    
+                    # Check if Queen was in the trick (13 points)
+                    if points_taken >= 13:
+                        r -= 0.5 # Massive penalty for eating the Queen
                 else:
                     # We didn't take points -> Small Reward
                     r = 0.002 
@@ -840,8 +848,13 @@ def train():
                 # Value Loss
                 value_loss = torch.nn.functional.mse_loss(new_values, b_returns)
                 
-                # Entropy Bonus (Increased to 0.03 to encourage exploration against tough opponents)
-                entropy_loss = -ENTROPY_COEF * entropies.mean()
+                # Entropy Bonus (Decaying)
+                # Calculate current entropy coef based on progress
+                # Linear decay from START to END over TOTAL_EPISODES
+                progress = min(1.0, (i_episode - start_episode) / TOTAL_EPISODES)
+                current_entropy_coef = ENTROPY_COEF_START - (ENTROPY_COEF_START - ENTROPY_COEF_END) * progress
+                
+                entropy_loss = -current_entropy_coef * entropies.mean()
                 
                 loss = policy_loss + VALUE_LOSS_COEF * value_loss + entropy_loss
                 
