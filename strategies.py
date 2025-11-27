@@ -121,8 +121,9 @@ class ExpertPolicy:
                 dangerous_spades = [c for c in my_spades if c.rank in dangerous_ranks]
                 safe_spades = [c for c in my_spades if c.rank not in dangerous_ranks]
                 
+                # Arching the Pig: If we have safe spades and no dangerous ones, lead high to force pig
                 if safe_spades and not dangerous_spades:
-                    return min(safe_spades, key=get_card_strength)
+                    return max(safe_spades, key=get_card_strength)
 
             # Standard Lead Logic
             safe_leads = [c for c in legal_actions if c.suit != Suit.SPADES and c.suit != Suit.HEARTS]
@@ -171,6 +172,15 @@ class ExpertPolicy:
                     safe_options = [c for c in following_cards if c.rank != 12]
                     if safe_options:
                         following_cards = safe_options
+
+                # 1.5 Last Player Escape
+                # If we are the last player and there are no points (Hearts or SQ) in the trick,
+                # we can safely play a high card to escape it.
+                is_last_player = (len(current_table) == 3)
+                points_in_trick = any(c.suit == Suit.HEARTS or (c.suit == Suit.SPADES and c.rank == 12) for c, _ in current_table)
+                
+                if is_last_player and not points_in_trick:
+                     return max(following_cards, key=get_card_strength)
 
                 # 2. Dump High Cards if No Risk
                 # If we can play under the winning rank, play the highest possible card
