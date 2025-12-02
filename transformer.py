@@ -369,8 +369,15 @@ class HeartsTransformer(nn.Module):
         # Positional Encoding
         self.pos_encoder = PositionalEncoding(d_model, dropout)
         
-        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, batch_first=True, dropout=dropout)
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        # --- Dual Transformer Architecture ---
+        # 1. History Encoder: Processes the 52-card history sequence
+        # We use a smaller encoder for this specific task
+        history_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, batch_first=True, dropout=dropout)
+        self.history_encoder = nn.TransformerEncoder(history_layer, num_layers=4) # 4 layers for history
+        
+        # 2. Main Encoder: Processes everything else + History Context
+        main_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, batch_first=True, dropout=dropout)
+        self.main_encoder = nn.TransformerEncoder(main_layer, num_layers=num_layers) # 6 layers for main logic
         
         # Output head
         self.output_head = nn.Linear(d_model, 52)
@@ -600,20 +607,66 @@ class HeartsTransformer(nn.Module):
         
         # Concatenate: (Batch, 1 + Seq_Len, Dim)
         x = torch.cat((cls_tokens, x), dim=1)
-        
-        # Update Padding Mask for CLS token
-        # CLS is never padding (False)
-        cls_mask = torch.zeros((batch_size, 1), dtype=torch.bool, device=x.device)
-        if padding_mask is not None:
-            padding_mask = torch.cat((cls_mask, padding_mask), dim=1)
-        
         # Add Positional Encoding
         x = self.pos_encoder(x)
-            
-        # Pass src_key_padding_mask to encoder
-        # shape: (Batch, Seq_Len)
-        output = self.transformer_encoder(x, src_key_padding_mask=padding_mask)
         
+        # --- Dual Transformer Logic ---
+        # Split input into History and Rest
+        # Indices: CLS(1) + Hand(13) + Table(4) = 18. History starts at 18.
+        # History length = 52. End = 18 + 52 = 70.
+        
+        # x shape: (Batch, 114, d_model)
+        # padding_mask shape: (Batch, 114)
+        
+        # 1. Extract History
+        # Note: We include CLS in the "Rest" part usually, but here we just slice the sequence.
+        # Actually, let's process History independently first.
+        
+        # Indices in x (which has CLS at 0):
+        # 0: CLS
+        # 1-13: Hand
+        # 14-17: Table
+        # 18-69: History (52 items)
+        # 70-108: Hidden
+        # 109-112: PStats
+        # 113: GStats
+        
+        history_start = 18
+        history_end = 70
+        
+        x_history = x[:, history_start:history_end, :]
+        mask_history = padding_mask[:, history_start:history_end]
+        
+        # 2. Encode History
+        # We pass the history segment through the History Encoder
+        # This allows the model to "digest" the game log before making a decision
+        x_history_encoded = self.history_encoder(x_history, src_key_padding_mask=mask_history)
+        
+        # 3. Re-assemble
+        # We replace the raw history embeddings with the encoded ones
+        # Or we can just concatenate them back.
+        # Since we sliced, we can just cat:
+        # [0:18] + [Encoded History] + [70:]
+        
+        x_pre = x[:, :history_start, :]
+        x_post = x[:, history_end:, :]
+        
+        mask_pre = padding_mask[:, :history_start]
+        mask_post = padding_mask[:, history_end:]
+        
+        x_combined = torch.cat((x_pre, x_history_encoded, x_post), dim=1)
+        mask_combined = torch.cat((mask_pre, mask_history, mask_post), dim=1)
+            
+        # 4. Main Encoder
+        output = self.main_encoder(x_combined, src_key_padding_mask=mask_combined)
+        
+        # Use [CLS] token output (index 0)
+        pooled = output[:, 0, :] 
+        
+        logits = self.output_head(pooled)
+        value = self.value_head(pooled)
+        
+        return logits, value
         # Use [CLS] token output (index 0)
         pooled = output[:, 0, :] 
         
