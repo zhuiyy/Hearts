@@ -101,8 +101,8 @@ class AIPlayer:
                     if random.random() < beta:
                         action_to_play_idx = teacher_action_idx
             
-            self.saved_log_probs.append(dist.log_prob(action_to_play_idx))
-            self.saved_values.append(value)
+            self.saved_log_probs.append(dist.log_prob(action_to_play_idx).detach())
+            self.saved_values.append(value.detach())
             self.saved_actions.append(action_to_save_idx) 
             
             action_idx_val = action_to_play_idx.item()
@@ -175,8 +175,8 @@ class AIPlayer:
             else:
                 action_to_play = student_card
 
-        self.saved_log_probs.append(dist.log_prob(torch.tensor(action_to_play.to_id(), device=self.device)))
-        self.saved_values.append(value)
+        self.saved_log_probs.append(dist.log_prob(torch.tensor(action_to_play.to_id(), device=self.device)).detach())
+        self.saved_values.append(value.detach())
         self.saved_actions.append(action_to_save) 
         
         return action_to_play
