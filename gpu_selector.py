@@ -68,16 +68,28 @@ def select_device():
 
     while True:
         try:
-            choice = input(f"Select GPU index (0-{len(gpus)-1}) or 'cpu': ").strip().lower()
+            choice = input(f"Select GPU index (0-{len(gpus)-1}), comma-separated for multiple (e.g. 0,1), or 'cpu': ").strip().lower()
             if choice == 'cpu':
                 return torch.device("cpu")
             
-            idx = int(choice)
-            if 0 <= idx < len(gpus):
-                print(f"Selected GPU {idx}: {gpus[idx]['name']}")
-                return torch.device(f"cuda:{idx}")
+            if ',' in choice:
+                indices = [int(x.strip()) for x in choice.split(',')]
+                valid = all(0 <= idx < len(gpus) for idx in indices)
+                if valid:
+                    print(f"Selected GPUs: {indices}")
+                    # Return list of devices or a string that train.py can handle?
+                    # Standard torch.device doesn't support list.
+                    # We will return a special string "cuda:0,1" which train.py needs to parse.
+                    return f"cuda:{','.join(map(str, indices))}"
+                else:
+                    print("Invalid indices.")
             else:
-                print("Invalid index.")
+                idx = int(choice)
+                if 0 <= idx < len(gpus):
+                    print(f"Selected GPU {idx}: {gpus[idx]['name']}")
+                    return torch.device(f"cuda:{idx}")
+                else:
+                    print("Invalid index.")
         except ValueError:
             print("Invalid input.")
 

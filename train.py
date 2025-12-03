@@ -230,8 +230,11 @@ class AIPlayer:
         
         return action_to_play
 
-def pretrain_supervised(model, device, log_data, episodes=1000):
+def pretrain_supervised(model, device, log_data, episodes=1000, parallel_model=None):
     print("Starting Supervised Pretraining...")
+    if parallel_model is None:
+        parallel_model = model
+        
     optimizer = optim.Adam(model.parameters(), lr=PRETRAIN_LR)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=50)
     
@@ -365,9 +368,15 @@ def pretrain_supervised(model, device, log_data, episodes=1000):
             masks = torch.stack(batch_masks)
             
             for _ in range(PRETRAIN_EPOCHS):
+                # Use parallel_model here too
                 x, padding_mask = model.assemble_batch(batch_states, device=device)
                 
-                logits, values = model(x=x, padding_mask=padding_mask)
+                # Note: assemble_batch is not parallelized here because it's complex.
+                # If we wanted full parallelism, we'd pass batch_states to parallel_model.forward
+                # But pretrain loop uses assemble_batch explicitly.
+                # Let's switch to using parallel_model(batch_raw_states=...) for consistency and parallelism
+                
+                logits, values = parallel_model(batch_raw_states=batch_states)
                 logits = logits.squeeze()
                 values = values.squeeze()
                 
@@ -425,10 +434,30 @@ def pretrain_supervised(model, device, log_data, episodes=1000):
 
 def train():
     model_path = 'hearts_model.pth'
-    device = gpu_selector.select_device()
-    print(f"Training on {device}")
+    device_selection = gpu_selector.select_device()
+    
+    use_data_parallel = False
+    device_ids = []
+    
+    if isinstance(device_selection, str) and "cuda:" in device_selection and "," in device_selection:
+        # Multiple GPUs selected
+        use_data_parallel = True
+        gpu_indices = [int(x) for x in device_selection.split(":")[1].split(",")]
+        device_ids = gpu_indices
+        device = torch.device(f"cuda:{gpu_indices[0]}") # Main device
+        print(f"Training on Multiple GPUs: {device_ids}")
+    else:
+        device = device_selection
+        print(f"Training on {device}")
     
     model = HeartsTransformer(d_model=HIDDEN_DIM, dropout=DROPOUT).to(device)
+    
+    if use_data_parallel:
+        # We wrap the model for training updates, but keep 'model' as the base for inference
+        parallel_model = torch.nn.DataParallel(model, device_ids=device_ids)
+    else:
+        parallel_model = model
+
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=1000)
     
@@ -469,7 +498,7 @@ def train():
     log_data = {'episodes': [], 'scores': [], 'avg_scores': [], 'policy_losses': [], 'value_losses': [], 'difficulty': [], 'phase': []}
 
     if not loaded_from_checkpoint:
-        pretrain_supervised(model, device, log_data, episodes=PRETRAIN_EPISODES)
+        pretrain_supervised(model, device, log_data, episodes=PRETRAIN_EPISODES, parallel_model=parallel_model)
     else:
         print("Skipping pretraining for loaded model.")
     
@@ -662,7 +691,9 @@ def train():
                 advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-9)
                 
             for _ in range(PPO_EPOCHS):
-                logits, new_values = model(batch_raw_states=batch_states)
+                # Use parallel_model for forward pass (supports DataParallel)
+                # We pass batch_raw_states as argument so DataParallel can split it
+                logits, new_values = parallel_model(batch_raw_states=batch_states)
                 logits = logits.squeeze()
                 new_values = new_values.squeeze()
                 
