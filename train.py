@@ -309,49 +309,68 @@ def train():
             advantages = b_returns - old_values
             if len(advantages) > 1:
                 advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-9)
-                
+            
+            # Pre-stack data for efficient slicing
+            b_actions_all = torch.stack(batch_actions)
+            b_masks_all = torch.stack(batch_masks)
+            
+            total_samples = len(batch_states)
+            indices = list(range(total_samples))
+            
             for _ in range(config.PPO_EPOCHS):
-                # Use parallel_model for forward pass (supports DataParallel)
-                # We pass batch_raw_states as argument so DataParallel can split it
-                logits, new_values = parallel_model(batch_raw_states=batch_states)
-                logits = logits.squeeze()
-                new_values = new_values.squeeze()
+                random.shuffle(indices)
                 
-                masks = torch.stack(batch_masks)
-                masked_logits = logits + masks
+                # Minibatch Update
+                for start_idx in range(0, total_samples, config.MINIBATCH_SIZE):
+                    end_idx = min(start_idx + config.MINIBATCH_SIZE, total_samples)
+                    mb_indices = indices[start_idx:end_idx]
+                    
+                    # Slice data
+                    mb_states = [batch_states[i] for i in mb_indices]
+                    mb_actions = b_actions_all[mb_indices]
+                    mb_masks = b_masks_all[mb_indices]
+                    mb_old_log_probs = old_log_probs[mb_indices]
+                    mb_advantages = advantages[mb_indices]
+                    mb_returns = b_returns[mb_indices]
+                    
+                    # Forward pass
+                    logits, new_values = parallel_model(batch_raw_states=mb_states)
+                    logits = logits.squeeze()
+                    new_values = new_values.squeeze()
+                    
+                    masked_logits = logits + mb_masks
+                    
+                    probs = torch.softmax(masked_logits, dim=1)
+                    dist = torch.distributions.Categorical(probs)
+                    
+                    new_log_probs = dist.log_prob(mb_actions)
+                    entropies = dist.entropy()
+                    
+                    ratio = torch.exp(new_log_probs - mb_old_log_probs)
+                    
+                    surr1 = ratio * mb_advantages
+                    surr2 = torch.clamp(ratio, 1.0 - config.CLIP_EPS, 1.0 + config.CLIP_EPS) * mb_advantages
+                    policy_loss = -torch.min(surr1, surr2).mean()
+                    
+                    value_loss = torch.nn.functional.mse_loss(new_values, mb_returns)
+                    
+                    progress = min(1.0, (i_episode - start_episode) / TOTAL_EPISODES)
+                    current_entropy_coef = config.ENTROPY_COEF_START - (config.ENTROPY_COEF_START - config.ENTROPY_COEF_END) * progress
+                    
+                    entropy_loss = -current_entropy_coef * entropies.mean()
+                    
+                    loss = policy_loss + config.VALUE_LOSS_COEF * value_loss + entropy_loss
+                    
+                    optimizer.zero_grad()
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.MAX_GRAD_NORM)
+                    optimizer.step()
+                    
+                    current_p_loss = policy_loss.item()
+                    current_v_loss = value_loss.item()
                 
-                probs = torch.softmax(masked_logits, dim=1)
-                dist = torch.distributions.Categorical(probs)
-                
-                b_actions = torch.stack(batch_actions)
-                new_log_probs = dist.log_prob(b_actions)
-                entropies = dist.entropy()
-                
-                ratio = torch.exp(new_log_probs - old_log_probs)
-                
-                surr1 = ratio * advantages
-                surr2 = torch.clamp(ratio, 1.0 - config.CLIP_EPS, 1.0 + config.CLIP_EPS) * advantages
-                policy_loss = -torch.min(surr1, surr2).mean()
-                
-                value_loss = torch.nn.functional.mse_loss(new_values, b_returns)
-                
-                progress = min(1.0, (i_episode - start_episode) / TOTAL_EPISODES)
-                current_entropy_coef = config.ENTROPY_COEF_START - (config.ENTROPY_COEF_START - config.ENTROPY_COEF_END) * progress
-                
-                entropy_loss = -current_entropy_coef * entropies.mean()
-                
-                loss = policy_loss + config.VALUE_LOSS_COEF * value_loss + entropy_loss
-                
-                optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), config.MAX_GRAD_NORM)
-                optimizer.step()
-                
-                # Throttle to reduce GPU load
+                # Throttle to reduce GPU load (once per epoch or per minibatch? Per epoch is fine)
                 time.sleep(config.THROTTLE_TIME)
-                
-                current_p_loss = policy_loss.item()
-                current_v_loss = value_loss.item()
             
             batch_log_probs = []
             batch_values = []
@@ -392,7 +411,7 @@ def train():
                 print(f"Error writing log: {e}")
         
         if i_episode % 50 == 0:
-            print(f"Episode {i_episode}\tAvg Score: {running_score:.2f}\tAvg Reward: {running_reward:.2f}\tPass: {pass_dir.name}\tDiff: {difficulty}")
+            print(f"Episode {i_episode:<6} Avg Score: {running_score:5.2f}   Avg Reward: {running_reward:5.2f}   Pass: {pass_dir.name:<6}   Diff: {difficulty}")
             scheduler.step(running_score)
             torch.save({
                 'epoch': i_episode,

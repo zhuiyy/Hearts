@@ -1,10 +1,11 @@
 # Hyperparameters & Configuration
 
 # --- PPO Training ---
-LEARNING_RATE = 1e-5 # Reduced from 1e-4 to prevent catastrophic forgetting of pretrained weights
+LEARNING_RATE = 1e-5 
 GAMMA = 0.99
 EPISODES = 5000 
-BATCH_SIZE = 32 
+BATCH_SIZE = 256 
+MINIBATCH_SIZE = 512 
 PPO_EPOCHS = 10 
 CLIP_EPS = 0.2
 ENTROPY_COEF_START = 0.03 
