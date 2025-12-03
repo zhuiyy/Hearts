@@ -66,8 +66,8 @@ def run_showcase():
     print(" STARTING SHOWCASE GAME ")
     print(" Player 0: AI Agent (Trained)")
     print(" Player 1: Expert Bot")
-    print(" Player 2: Random Bot")
-    print(" Player 3: Min Bot")
+    print(" Player 2: Expert Bot")
+    print(" Player 3: Expert Bot")
     print("="*50 + "\n")
     
     # Reset
@@ -91,8 +91,8 @@ def run_showcase():
     pass_policies = [
         ai_pass_wrapper, 
         strategies.ExpertPolicy.pass_policy, 
-        strategies.random_pass_policy, 
-        strategies.random_pass_policy
+        strategies.ExpertPolicy.pass_policy, 
+        strategies.ExpertPolicy.pass_policy
     ]
     
     # Execute passing

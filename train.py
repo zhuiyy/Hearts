@@ -84,9 +84,14 @@ def train():
             try:
                 checkpoint = torch.load(config.PRETRAINED_MODEL_PATH, map_location=device)
                 if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-                    model.load_state_dict(checkpoint['model_state_dict'])
+                    # Filter out keys that don't match (e.g. if architecture changed slightly)
+                    model_dict = model.state_dict()
+                    pretrained_dict = {k: v for k, v in checkpoint['model_state_dict'].items() if k in model_dict and v.size() == model_dict[k].size()}
+                    model_dict.update(pretrained_dict)
+                    model.load_state_dict(model_dict)
+                    
                     # We do NOT load optimizer state from pretraining, as we are starting fresh RL
-                    print("Pretrained weights loaded. Starting RL from scratch.")
+                    print(f"Pretrained weights loaded ({len(pretrained_dict)}/{len(model_dict)} layers). Starting RL from scratch.")
                 else:
                     print("Invalid pretrained model format.")
             except Exception as e:

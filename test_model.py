@@ -4,7 +4,8 @@ import numpy as np
 import random
 from game import GameV2
 from transformer import HeartsTransformer
-from train import AIPlayer, HIDDEN_DIM, DROPOUT
+from agent import AIPlayer
+import config
 from strategies import ExpertPolicy
 from data_structure import PassDirection
 import gpu_selector
@@ -14,24 +15,33 @@ def test_model(num_games=300):
     device = gpu_selector.select_device()
     print(f"Testing on {device}")
 
-    model = HeartsTransformer(d_model=HIDDEN_DIM, dropout=DROPOUT).to(device)
-    model_path = 'hearts_model.pth'
-
-    if os.path.exists(model_path):
-        print(f"Loading model from {model_path}...")
-        try:
-            checkpoint = torch.load(model_path, map_location=device)
-            if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-                model.load_state_dict(checkpoint['model_state_dict'])
-            else:
-                model.load_state_dict(checkpoint)
-            model.eval()
-            print("Model loaded successfully.")
-        except Exception as e:
-            print(f"Failed to load model: {e}")
-            return
+    model = HeartsTransformer(d_model=config.HIDDEN_DIM, dropout=config.DROPOUT).to(device)
+    
+    # Try to load best model first, then regular model, then pretrained
+    if os.path.exists(config.BEST_MODEL_PATH):
+        model_path = config.BEST_MODEL_PATH
+        print(f"Found Best Model: {model_path}")
+    elif os.path.exists(config.MODEL_PATH):
+        model_path = config.MODEL_PATH
+        print(f"Found Regular Model: {model_path}")
+    elif os.path.exists(config.PRETRAINED_MODEL_PATH):
+        model_path = config.PRETRAINED_MODEL_PATH
+        print(f"Found Pretrained Model: {model_path}")
     else:
-        print("Error: No model found at hearts_model.pth")
+        print("Error: No model found in saved_models/")
+        return
+
+    print(f"Loading model from {model_path}...")
+    try:
+        checkpoint = torch.load(model_path, map_location=device)
+        if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['model_state_dict'])
+        else:
+            model.load_state_dict(checkpoint)
+        model.eval()
+        print("Model loaded successfully.")
+    except Exception as e:
+        print(f"Failed to load model: {e}")
         return
 
     # 2. Setup Players
