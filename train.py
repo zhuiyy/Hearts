@@ -13,18 +13,23 @@ import strategies
 from strategies import ExpertPolicy
 import gpu_selector
 
+import time
+
 # Hyperparameters
 # --- PPO Training ---
 LEARNING_RATE = 1e-4
 GAMMA = 0.99
 EPISODES = 5000 
-BATCH_SIZE = 64 
+BATCH_SIZE = 32 # Reduced from 64 to save GPU memory
 PPO_EPOCHS = 10 
 CLIP_EPS = 0.2
 ENTROPY_COEF_START = 0.03 
 ENTROPY_COEF_END = 0.005 
 VALUE_LOSS_COEF = 0.5 
 MAX_GRAD_NORM = 0.5 
+
+# --- Resource Management ---
+THROTTLE_TIME = 0.05 # Sleep time in seconds to reduce GPU utilization
 
 # --- Model Architecture ---
 HIDDEN_DIM = 256 
@@ -34,7 +39,7 @@ WEIGHT_DECAY = 1e-5
 # --- Supervised Pretraining ---
 PRETRAIN_LR = 1e-4 
 PRETRAIN_EPISODES = 5000
-PRETRAIN_BATCH_SIZE = 64 
+PRETRAIN_BATCH_SIZE = 32 # Reduced from 64
 PRETRAIN_EPOCHS = 10 
 LABEL_SMOOTHING = 0.0 
 
@@ -225,7 +230,7 @@ class AIPlayer:
         
         return action_to_play
 
-def pretrain_supervised(model, device, episodes=1000):
+def pretrain_supervised(model, device, log_data, episodes=1000):
     print("Starting Supervised Pretraining...")
     optimizer = optim.Adam(model.parameters(), lr=PRETRAIN_LR)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=50)
@@ -237,6 +242,11 @@ def pretrain_supervised(model, device, episodes=1000):
     running_p_loss = 0.0
     running_v_loss = 0.0
     running_acc = 0.0
+    
+    # For logging
+    running_score = 0
+    last_p_loss = 0.0
+    last_v_loss = 0.0
     
     batch_states = []
     batch_actions = []
@@ -284,6 +294,28 @@ def pretrain_supervised(model, device, episodes=1000):
         # Rewards
         player_final_score = scores[0]
         player_raw_score = raw_scores[0]
+        
+        # --- Logging ---
+        if i_episode == 0:
+            running_score = player_final_score
+        else:
+            running_score = 0.05 * player_final_score + 0.95 * running_score
+            
+        log_data['episodes'].append(i_episode - episodes)
+        log_data['scores'].append(player_final_score)
+        log_data['avg_scores'].append(running_score)
+        log_data['policy_losses'].append(last_p_loss)
+        log_data['value_losses'].append(last_v_loss)
+        log_data['difficulty'].append("Pretrain")
+        log_data['phase'].append("pretrain")
+        
+        if i_episode % 10 == 0:
+            try:
+                with open("training_log.json", "w") as f:
+                    json.dump(log_data, f)
+            except Exception as e:
+                print(f"Error writing log: {e}")
+
         shot_the_moon = (player_raw_score == 26)
         
         rewards = []
@@ -361,10 +393,16 @@ def pretrain_supervised(model, device, episodes=1000):
                 optimizer.step()
                 scheduler.step(loss)
                 
+                # Throttle to reduce GPU load
+                time.sleep(THROTTLE_TIME)
+                
                 running_loss += loss.item()
                 running_p_loss += policy_loss.item()
                 running_v_loss += value_loss.item()
                 running_acc += accuracy.item()
+                
+                last_p_loss = policy_loss.item()
+                last_v_loss = value_loss.item()
             
             batch_states = []
             batch_actions = []
@@ -396,6 +434,8 @@ def train():
     
     start_episode = 0
     loaded_from_checkpoint = False
+    loaded_running_score = None
+    loaded_stage_idx = None
     
     if os.path.exists(model_path):
         user_input = input(f"Found existing model '{model_path}'. Load it? (y/n): ").strip().lower()
@@ -410,6 +450,10 @@ def train():
                     if 'epoch' in checkpoint:
                         start_episode = checkpoint['epoch'] + 1
                         print(f"Resuming from episode {start_episode}")
+                    if 'running_score' in checkpoint:
+                        loaded_running_score = checkpoint['running_score']
+                    if 'stage_idx' in checkpoint:
+                        loaded_stage_idx = checkpoint['stage_idx']
                 else:
                     model.load_state_dict(checkpoint)
                     print("Loaded legacy model format. Starting from episode 0.")
@@ -422,8 +466,10 @@ def train():
     else:
         print("No existing model found. Starting from scratch.")
 
+    log_data = {'episodes': [], 'scores': [], 'avg_scores': [], 'policy_losses': [], 'value_losses': [], 'difficulty': [], 'phase': []}
+
     if not loaded_from_checkpoint:
-        pretrain_supervised(model, device, episodes=PRETRAIN_EPISODES)
+        pretrain_supervised(model, device, log_data, episodes=PRETRAIN_EPISODES)
     else:
         print("Skipping pretraining for loaded model.")
     
@@ -437,7 +483,7 @@ def train():
     running_reward = 0
     running_score = 0
     
-    log_data = {'episodes': [], 'scores': [], 'avg_scores': [], 'policy_losses': [], 'value_losses': [], 'difficulty': []}
+    # log_data initialized above
     
     batch_log_probs = []
     batch_values = []
@@ -466,8 +512,12 @@ def train():
     ]
     
     if loaded_from_checkpoint:
-        start_stage_idx = 3
-        print("Resuming training: Starting from Stage 5 (3 Expert Bots)")
+        if loaded_stage_idx is not None:
+            start_stage_idx = loaded_stage_idx
+            print(f"Resuming training: Starting from Stage {start_stage_idx} (Loaded from checkpoint)")
+        else:
+            start_stage_idx = 3
+            print("Resuming training: Starting from Stage 5 (3 Expert Bots) - Default for legacy checkpoint")
     else:
         start_stage_idx = 0
         print("Starting fresh training: Starting from Stage 2 (3 Random Bots)")
@@ -477,6 +527,10 @@ def train():
     consecutive_good_epochs = 0
     POOL_START_IDX = 5
     
+    best_running_score = float('inf') # Track best score
+    if loaded_running_score is not None:
+        best_running_score = loaded_running_score # Assume loaded model was the best at its time
+
     for i_episode in range(start_episode, start_episode + TOTAL_EPISODES):
         ai_player.reset()
         for opp in opponent_agents:
@@ -642,6 +696,9 @@ def train():
                 torch.nn.utils.clip_grad_norm_(model.parameters(), MAX_GRAD_NORM)
                 optimizer.step()
                 
+                # Throttle to reduce GPU load
+                time.sleep(THROTTLE_TIME)
+                
                 current_p_loss = policy_loss.item()
                 current_v_loss = value_loss.item()
             
@@ -656,6 +713,14 @@ def train():
         if i_episode == 0:
             running_score = player_final_score
             running_reward = total_reward
+        elif i_episode == start_episode and loaded_running_score is not None:
+             # Resume running score from checkpoint
+             running_score = 0.05 * player_final_score + 0.95 * loaded_running_score
+             running_reward = total_reward # Reset reward tracking or approximate it
+        elif i_episode == start_episode:
+             # Resumed but no saved score, treat as fresh start for stats
+             running_score = player_final_score
+             running_reward = total_reward
         else:
             running_score = 0.05 * player_final_score + 0.95 * running_score
             running_reward = 0.05 * total_reward + 0.95 * running_reward
@@ -666,6 +731,7 @@ def train():
         log_data['policy_losses'].append(current_p_loss)
         log_data['value_losses'].append(current_v_loss)
         log_data['difficulty'].append(difficulty)
+        log_data['phase'].append('ppo')
         
         if i_episode % 10 == 0:
             try:
@@ -681,13 +747,30 @@ def train():
                 'epoch': i_episode,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
+                'running_score': running_score,
+                'stage_idx': current_stage_idx
             }, model_path)
+            
+            # Save Best Model
+            if running_score < best_running_score:
+                best_running_score = running_score
+                torch.save({
+                    'epoch': i_episode,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'score': best_running_score,
+                    'running_score': running_score,
+                    'stage_idx': current_stage_idx
+                }, 'hearts_model_best.pth')
+                print(f"  -> New Best Model Saved! Score: {best_running_score:.2f}")
 
     print("Training Complete.")
     torch.save({
         'epoch': start_episode + TOTAL_EPISODES - 1,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
+        'running_score': running_score,
+        'stage_idx': current_stage_idx
     }, model_path)
 
 if __name__ == "__main__":

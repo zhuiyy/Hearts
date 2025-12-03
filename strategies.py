@@ -47,16 +47,7 @@ class ExpertPolicy:
                 
         if attempt_stm:
             # Strategy: Keep high cards, pass low cards or holes.
-            # Pass lowest cards to clear hand of losers.
-            # But keep some low cards for lead control? No, in STM you want to win everything.
-            # You want to pass cards that you CANNOT win with.
-            # i.e. Low cards in suits where you don't have the Ace/King.
-            
             def stm_pass_score(card: Card) -> int:
-                # Higher score = More likely to pass (Bad for STM)
-                # We want to keep High cards (Low score)
-                # We want to pass Low cards (High score)
-                
                 rank_val = 14 if card.rank == 1 else card.rank
                 return 15 - rank_val # 2 -> 13 (Pass), A -> 1 (Keep)
             
@@ -66,8 +57,15 @@ class ExpertPolicy:
         else:
             # Normal Strategy: Avoid taking points.
             # Pass dangerous high cards.
+            # NEW: Prioritize creating voids (short suits)
+            
+            suit_counts = {s: 0 for s in Suit}
+            for c in hand:
+                suit_counts[c.suit] += 1
+                
             def pass_score(card: Card) -> int:
                 score = 0
+                # Danger Score
                 if card.suit == Suit.SPADES:
                     if card.rank == 12: score += 100 # Queen - DANGEROUS
                     elif card.rank == 13: score += 90 # King - Dangerous if Q is out
@@ -79,6 +77,20 @@ class ExpertPolicy:
                 else:
                     if card.rank == 1: score += 15
                     else: score += card.rank
+                
+                # Void Creation Bonus
+                # If suit length is <= 3 and we don't have high cards in it, try to void it.
+                # But don't void if we have dangerous cards (handled by danger score).
+                count = suit_counts[card.suit]
+                if count <= 3:
+                    # Check if we have dangerous cards in this suit
+                    has_danger = False
+                    if card.suit == Suit.SPADES:
+                        has_danger = any(c.rank in [12, 13, 1] for c in hand if c.suit == Suit.SPADES)
+                    
+                    if not has_danger:
+                        score += (4 - count) * 10 # Shorter suit -> Higher bonus
+                        
                 return score
                 
             hand.sort(key=pass_score, reverse=True)
@@ -98,12 +110,15 @@ class ExpertPolicy:
         others_have_points = False
         my_points = player.points
         
+        # Check if SOMEONE ELSE is Shooting the Moon (STM Blocking)
+        opponent_stm_threat = False
         if 'players_stats' in info:
             for i, stats in enumerate(info['players_stats']):
                 if i != info['player_id']: # Not me
                     if stats['points'] > 0:
                         others_have_points = True
-                        break
+                    if stats['points'] >= 18: # Threat threshold
+                        opponent_stm_threat = True
         
         trying_stm = (my_points > 0 and not others_have_points)
         
@@ -112,6 +127,15 @@ class ExpertPolicy:
             if trying_stm:
                 return max(legal_actions, key=get_card_strength)
             
+            # STM Blocking Lead
+            if opponent_stm_threat:
+                # If opponent is threatening STM, we should NOT lead a suit they are void in (if we know).
+                # But we don't know voids easily.
+                # Best bet: Lead a low heart if we have it? No, that gives them points.
+                # Lead a suit where we have high cards to force them to play?
+                # Actually, leading is hard to block STM with. Just play safe.
+                pass
+
             # Piggy Hunting Logic
             if not piggy_pulled:
                 # If we have S12, then S13 and S1 are NOT dangerous (we can't catch pig from others)
@@ -160,6 +184,20 @@ class ExpertPolicy:
                     else:
                         return min(following_cards, key=get_card_strength)
 
+                # STM Blocking (Following)
+                if opponent_stm_threat:
+                    # If there are points in the trick, we MUST try to win it if we can, 
+                    # provided we don't give them the rest of the points.
+                    # Actually, just taking ONE point stops STM.
+                    points_in_trick = any(c.suit == Suit.HEARTS or (c.suit == Suit.SPADES and c.rank == 12) for c, _ in current_table)
+                    
+                    if points_in_trick:
+                        # Try to win!
+                        winning_cards = [c for c in following_cards if (14 if c.rank == 1 else c.rank) > winning_rank]
+                        if winning_cards:
+                            # Win with the lowest possible card that wins
+                            return min(winning_cards, key=get_card_strength)
+                
                 # Normal Logic
                 
                 # 1. Feed the Pig (S12) Logic
@@ -197,6 +235,15 @@ class ExpertPolicy:
                 # Void - Dump cards
                 if trying_stm:
                     pass # Fall through to normal dump logic
+
+                # STM Blocking (Void)
+                if opponent_stm_threat:
+                    # Dump a point card if possible to someone who is NOT the threat?
+                    # Or just hold points?
+                    # Actually, if we dump a heart to the threat, we help them!
+                    # We should dump points to NON-threats.
+                    # But we don't know who will win the trick yet (unless we are last).
+                    pass
 
                 # 1. Dump SQ (S12) - Always priority #1
                 sq = next((c for c in legal_actions if c.suit == Suit.SPADES and c.rank == 12), None)
