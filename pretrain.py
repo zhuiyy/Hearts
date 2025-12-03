@@ -134,7 +134,7 @@ def pretrain_supervised(model, device, log_data, episodes=1000, parallel_model=N
         R = 0
         returns = []
         for r in reversed(rewards):
-            R = r + GAMMA * R
+            R = r + config.GAMMA * R
             returns.insert(0, R)
             
         batch_states.extend(ai_player.saved_states)
