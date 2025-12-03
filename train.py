@@ -332,15 +332,15 @@ def train():
             
         total_reward = sum(rewards)
         if i_episode == 0:
-            running_score = player_final_score
+            running_score = 10.0 # Start with a conservative score to avoid initial fluctuation bias
             running_reward = total_reward
         elif i_episode == start_episode and loaded_running_score is not None:
              # Resume running score from checkpoint
-             running_score = 0.05 * player_final_score + 0.95 * loaded_running_score
-             running_reward = total_reward # Reset reward tracking or approximate it
+             running_score = loaded_running_score
+             running_reward = total_reward 
         elif i_episode == start_episode:
-             # Resumed but no saved score, treat as fresh start for stats
-             running_score = player_final_score
+             # Resumed but no saved score
+             running_score = 10.0
              running_reward = total_reward
         else:
             running_score = 0.05 * player_final_score + 0.95 * running_score
@@ -373,7 +373,8 @@ def train():
             }, model_path)
             
             # Save Best Model
-            if running_score < best_running_score:
+            # Only save best model after some warmup to let moving average stabilize
+            if i_episode > start_episode + 50 and running_score < best_running_score:
                 best_running_score = running_score
                 torch.save({
                     'epoch': i_episode,
