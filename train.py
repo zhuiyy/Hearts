@@ -125,14 +125,13 @@ def train():
     print(f"Total PPO Episodes: {TOTAL_EPISODES}")
 
     STAGES = [
-        ("Stage 2: 3 Random Bots", [strategies.random_policy, strategies.random_policy, strategies.random_policy]),
-        ("Stage 3: 2 Min + 1 Expert", [strategies.min_policy, strategies.min_policy, ExpertPolicy.play_policy]),
-        ("Stage 4: 1 Min + 2 Expert", [strategies.min_policy, ExpertPolicy.play_policy, ExpertPolicy.play_policy]),
-        ("Stage 5: 3 Expert", [ExpertPolicy.play_policy, ExpertPolicy.play_policy, ExpertPolicy.play_policy]),
-        ("Stage 6: 2 Expert + 1 Random", [ExpertPolicy.play_policy, ExpertPolicy.play_policy, strategies.random_policy]),
-        ("Stage 7: 2 Expert + 1 Pool", [ExpertPolicy.play_policy, ExpertPolicy.play_policy, 'pool']),
-        ("Stage 8: 1 Expert + 2 Pool", [ExpertPolicy.play_policy, 'pool', 'pool']),
-        ("Stage 9: 3 Pool", ['pool', 'pool', 'pool']),
+        # Removed "3 Random Bots" stage to prevent learning bad habits (e.g. "playing low always works")
+        ("Stage 1: 1 Expert + 2 Random", [ExpertPolicy.play_policy, strategies.random_policy, strategies.random_policy]),
+        ("Stage 2: 2 Expert + 1 Random", [ExpertPolicy.play_policy, ExpertPolicy.play_policy, strategies.random_policy]),
+        ("Stage 3: 3 Expert", [ExpertPolicy.play_policy, ExpertPolicy.play_policy, ExpertPolicy.play_policy]),
+        ("Stage 4: 2 Expert + 1 Pool", [ExpertPolicy.play_policy, ExpertPolicy.play_policy, 'pool']),
+        ("Stage 5: 1 Expert + 2 Pool", [ExpertPolicy.play_policy, 'pool', 'pool']),
+        ("Stage 6: 3 Pool", ['pool', 'pool', 'pool']),
     ]
     
     if loaded_from_checkpoint:
@@ -140,16 +139,16 @@ def train():
             start_stage_idx = loaded_stage_idx
             print(f"Resuming training: Starting from Stage {start_stage_idx} (Loaded from checkpoint)")
         else:
-            start_stage_idx = 3
-            print("Resuming training: Starting from Stage 5 (3 Expert Bots) - Default for legacy checkpoint")
+            start_stage_idx = 2
+            print("Resuming training: Starting from Stage 3 (3 Expert Bots) - Default for legacy checkpoint")
     else:
         start_stage_idx = 0
-        print("Starting fresh training: Starting from Stage 2 (3 Random Bots)")
+        print("Starting fresh training: Starting from Stage 1 (1 Expert + 2 Random)")
         
     current_stage_idx = start_stage_idx
     stage_episode_count = 0
     consecutive_good_epochs = 0
-    POOL_START_IDX = 5
+    POOL_START_IDX = 3
     
     best_running_score = float('inf') # Track best score
     if loaded_running_score is not None:
@@ -225,29 +224,55 @@ def train():
         
         player_final_score = scores[0]
         player_raw_score = raw_scores[0]
-        shot_the_moon = (player_raw_score == 26)
+        
+        # --- NEW REWARD FUNCTION: Relative Score ---
+        # Goal: Maximize (Avg_Opponent_Score - My_Score)
+        # This naturally handles Shooting the Moon (My=0, Opps=26 -> Huge Reward)
+        # and normal play (My=0, Opps=Avg -> Positive Reward)
+        
+        opp_scores = scores[1:]
+        avg_opp_score = sum(opp_scores) / 3.0
+        
+        # Scale factor: 10.0 roughly normalizes the range to [-2.6, +2.6]
+        # STM: (26 - 0)/10 = +2.6
+        # Eat Queen: (4.3 - 13)/10 = -0.87
+        # Perfect Safe: (8.6 - 0)/10 = +0.86
+        relative_reward = (avg_opp_score - player_final_score) / 10.0
         
         rewards = []
+        
+        # Distribute reward across all actions in the episode
+        # We use a pure terminal reward to avoid noisy intermediate signals
+        # But we can add small shaping rewards for tricks if needed. 
+        # For now, let's try pure terminal reward + small trick penalty shaping.
+        
+        # Pass Phase Rewards (3 actions)
         if pass_dir != PassDirection.KEEP:
-             pass_reward = 0.5 if shot_the_moon else -float(player_final_score) / 100.0
              for _ in range(3):
-                 rewards.append(pass_reward)
+                 rewards.append(relative_reward * 0.1) # Small signal for passing
 
+        # Trick Phase Rewards (13 actions)
         for trick in trick_history:
-            if shot_the_moon:
-                r = 0.04 
-            else:
-                points_taken = trick.score if trick.winner == 0 else 0
-                if points_taken > 0:
-                    r = -float(points_taken) / 100.0
-                    if points_taken >= 13:
-                        r -= 0.5 
-                else:
-                    r = 0.002 
-                    if trick.winner != 0 and trick.score > 0:
-                        r += 0.01
+            # Intermediate shaping: slight penalty for taking points to encourage safety
+            # But main signal comes from final relative_reward
+            r = 0.0
+            if trick.winner == 0:
+                points = trick.score
+                if points > 0:
+                    r = -0.05 * (points / 13.0) # Small penalty for taking points
+            
+            # Add the terminal reward to the last action, or distribute it?
+            # Standard PPO often uses terminal reward at the end.
+            # Here we add the relative_reward to EVERY step (or just the last).
+            # Let's add it to every step but scaled down, or just use it as the return.
+            # Better approach: The return G_t will propagate the terminal reward back.
+            # So we just give 0 intermediate reward and big terminal reward.
+            
             rewards.append(r)
             
+        # Add the big relative reward to the very last action
+        rewards[-1] += relative_reward
+
         if len(rewards) != len(ai_player.saved_log_probs):
             min_len = min(len(rewards), len(ai_player.saved_log_probs))
             rewards = rewards[:min_len]
