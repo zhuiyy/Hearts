@@ -14,6 +14,13 @@ import gpu_selector
 from agent import AIPlayer, OpponentPool
 import config
 
+import torch.nn.functional as F
+
+# Hyperparameters for Aux Tasks
+AUX_SQ_COEF = 0.5
+AUX_VOID_COEF = 0.5
+STM_BONUS = 5.0 # Bonus for Shooting the Moon
+
 def train():
     model_path = config.MODEL_PATH
     device_selection = gpu_selector.select_device()
@@ -115,6 +122,11 @@ def train():
     batch_actions = []
     batch_masks = []
     batch_returns = []
+    
+    # CTDE Batches
+    batch_global_states = []
+    batch_sq_labels = []
+    batch_void_labels = []
 
     try:
         total_episodes_input = input("Enter total episodes for PPO training (default 10000): ").strip()
@@ -225,20 +237,21 @@ def train():
         player_final_score = scores[0]
         player_raw_score = raw_scores[0]
         
-        # --- NEW REWARD FUNCTION: Relative Score ---
+        # --- NEW REWARD FUNCTION: Relative Score + STM Bonus ---
         # Goal: Maximize (Avg_Opponent_Score - My_Score)
-        # This naturally handles Shooting the Moon (My=0, Opps=26 -> Huge Reward)
-        # and normal play (My=0, Opps=Avg -> Positive Reward)
         
         opp_scores = scores[1:]
         avg_opp_score = sum(opp_scores) / 3.0
         
-        # Scale factor: 10.0 roughly normalizes the range to [-2.6, +2.6]
-        # STM: (26 - 0)/10 = +2.6
-        # Eat Queen: (4.3 - 13)/10 = -0.87
-        # Perfect Safe: (8.6 - 0)/10 = +0.86
         relative_reward = (avg_opp_score - player_final_score) / 10.0
         
+        # STM Bonus: If I got 0 and opponents got 26 (STM), give huge bonus
+        # Note: In end_game_scoring, if STM happens, scores are already flipped (0 vs 26)
+        # So if player_final_score is 0 and avg_opp_score is 26, relative_reward is 2.6
+        # We add extra bonus to encourage this high-risk play
+        if player_final_score == 0 and avg_opp_score == 26:
+            relative_reward += STM_BONUS
+            
         rewards = []
         
         # Distribute reward across all actions in the episode
@@ -281,6 +294,10 @@ def train():
             ai_player.saved_states = ai_player.saved_states[:min_len]
             ai_player.saved_actions = ai_player.saved_actions[:min_len]
             ai_player.saved_masks = ai_player.saved_masks[:min_len]
+            # CTDE
+            ai_player.saved_global_states = ai_player.saved_global_states[:min_len]
+            ai_player.saved_sq_labels = ai_player.saved_sq_labels[:min_len]
+            ai_player.saved_void_labels = ai_player.saved_void_labels[:min_len]
 
         R = 0
         returns = []
@@ -294,6 +311,11 @@ def train():
         batch_actions.extend(ai_player.saved_actions)
         batch_masks.extend(ai_player.saved_masks)
         batch_returns.extend(returns)
+        
+        # CTDE Extend
+        batch_global_states.extend(ai_player.saved_global_states)
+        batch_sq_labels.extend(ai_player.saved_sq_labels)
+        batch_void_labels.extend(ai_player.saved_void_labels)
 
         current_p_loss = 0.0
         current_v_loss = 0.0
@@ -314,6 +336,11 @@ def train():
             b_actions_all = torch.stack(batch_actions)
             b_masks_all = torch.stack(batch_masks)
             
+            # CTDE Stacking
+            b_global_states_all = torch.stack(batch_global_states)
+            b_sq_labels_all = torch.stack(batch_sq_labels)
+            b_void_labels_all = torch.stack(batch_void_labels)
+            
             total_samples = len(batch_states)
             indices = list(range(total_samples))
             
@@ -333,8 +360,16 @@ def train():
                     mb_advantages = advantages[mb_indices]
                     mb_returns = b_returns[mb_indices]
                     
-                    # Forward pass
-                    logits, new_values = parallel_model(batch_raw_states=mb_states)
+                    # CTDE Slice
+                    mb_global_states = b_global_states_all[mb_indices]
+                    mb_sq_labels = b_sq_labels_all[mb_indices]
+                    mb_void_labels = b_void_labels_all[mb_indices]
+                    
+                    # Forward pass with Global State (CTDE)
+                    logits, new_values, pred_sq, pred_void = parallel_model(
+                        batch_raw_states=mb_states,
+                        global_state=mb_global_states
+                    )
                     logits = logits.squeeze()
                     new_values = new_values.squeeze()
                     
@@ -354,12 +389,18 @@ def train():
                     
                     value_loss = torch.nn.functional.mse_loss(new_values, mb_returns)
                     
+                    # Aux Losses
+                    loss_sq = F.cross_entropy(pred_sq, mb_sq_labels)
+                    loss_void = F.binary_cross_entropy_with_logits(pred_void, mb_void_labels)
+                    
                     progress = min(1.0, (i_episode - start_episode) / TOTAL_EPISODES)
                     current_entropy_coef = config.ENTROPY_COEF_START - (config.ENTROPY_COEF_START - config.ENTROPY_COEF_END) * progress
                     
                     entropy_loss = -current_entropy_coef * entropies.mean()
                     
-                    loss = policy_loss + config.VALUE_LOSS_COEF * value_loss + entropy_loss
+                    # Total Loss
+                    loss = policy_loss + config.VALUE_LOSS_COEF * value_loss + entropy_loss + \
+                           AUX_SQ_COEF * loss_sq + AUX_VOID_COEF * loss_void
                     
                     optimizer.zero_grad()
                     loss.backward()
@@ -378,6 +419,11 @@ def train():
             batch_actions = []
             batch_masks = []
             batch_returns = []
+            
+            # CTDE Clear
+            batch_global_states = []
+            batch_sq_labels = []
+            batch_void_labels = []
             
         total_reward = sum(rewards)
         if i_episode == 0:

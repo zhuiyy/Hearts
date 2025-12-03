@@ -83,8 +83,14 @@ def run_showcase():
     
     # Wrapper to print AI's passing decision
     def ai_pass_wrapper(player, info):
+        # CTDE: Remove global info for inference to ensure fair play
+        info_inference = info.copy()
+        if 'global_state' in info_inference: del info_inference['global_state']
+        if 'sq_label' in info_inference: del info_inference['sq_label']
+        if 'void_label' in info_inference: del info_inference['void_label']
+        
         print(f"AI Hand before pass: {print_card_list(player.hand)}")
-        passed = ai_player.pass_policy(player, info)
+        passed = ai_player.pass_policy(player, info_inference)
         print(f"AI chose to pass:    {print_card_list(passed)}")
         return passed
 
@@ -108,7 +114,14 @@ def run_showcase():
     # Wrapper to print AI's play decision
     def ai_play_wrapper(player, info, legal, order):
         nonlocal current_trick_ai_value
-        card = ai_player.play_policy(player, info, legal, order)
+        
+        # CTDE: Remove global info for inference
+        info_inference = info.copy()
+        if 'global_state' in info_inference: del info_inference['global_state']
+        if 'sq_label' in info_inference: del info_inference['sq_label']
+        if 'void_label' in info_inference: del info_inference['void_label']
+
+        card = ai_player.play_policy(player, info_inference, legal, order)
         # Get the last value prediction if available
         current_trick_ai_value = ai_player.saved_values[-1].item() if ai_player.saved_values else 0.0
         return card

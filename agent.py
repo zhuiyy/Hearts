@@ -31,6 +31,11 @@ class AIPlayer:
         self.passed_cards = []
         self.received_cards = []
         self.hand_before_pass = set()
+        
+        # CTDE Data
+        self.saved_global_states = []
+        self.saved_sq_labels = []
+        self.saved_void_labels = []
 
     def reset(self):
         self.saved_log_probs = []
@@ -42,6 +47,11 @@ class AIPlayer:
         self.passed_cards = []
         self.received_cards = []
         self.hand_before_pass = set()
+        
+        # CTDE Data
+        self.saved_global_states = []
+        self.saved_sq_labels = []
+        self.saved_void_labels = []
 
     def pass_policy(self, player, info, teacher_policy=None, beta=1.0) -> List[Card]:
         self.hand_before_pass = set(player.hand)
@@ -68,8 +78,30 @@ class AIPlayer:
             
             state_snapshot = self.model.get_raw_state()
             self.saved_states.append(state_snapshot)
+            
+            # CTDE Collection (Pass Phase)
+            # Even in pass phase, we can collect global state, though SQ/Void might be less relevant
+            # But to keep batch alignment, we MUST collect something.
+            # Let's collect real data if available, or zeros.
+            global_state = info.get('global_state', None)
+            sq_label = info.get('sq_label', 4)
+            void_label = info.get('void_label', [0.0]*16)
+            
+            if global_state is not None:
+                self.saved_global_states.append(global_state)
+                # Forward pass with global state (for Value Head)
+                logits, value, _, _ = self.model(x=None, global_state=global_state.unsqueeze(0))
+            else:
+                # Inference mode (no global state)
+                # We append a dummy zero tensor to keep list length consistent, 
+                # OR we handle it in train.py. 
+                # Ideally, agent.py should be robust.
+                self.saved_global_states.append(torch.zeros(208, device=self.device))
+                logits, value, _, _ = self.model(x=None, global_state=None)
 
-            logits, value = self.model(x=None)
+            self.saved_sq_labels.append(torch.tensor(sq_label, device=self.device))
+            self.saved_void_labels.append(torch.tensor(void_label, device=self.device, dtype=torch.float32))
+
             logits = logits.squeeze() 
             
             mask = torch.full((52,), float('-inf'), device=self.device)
@@ -102,7 +134,10 @@ class AIPlayer:
                         action_to_play_idx = teacher_action_idx
             
             self.saved_log_probs.append(dist.log_prob(action_to_play_idx).detach())
-            self.saved_values.append(value.detach())
+            if value is not None:
+                self.saved_values.append(value.detach())
+            else:
+                self.saved_values.append(torch.tensor(0.0, device=self.device))
             self.saved_actions.append(action_to_save_idx) 
             
             action_idx_val = action_to_play_idx.item()
@@ -134,7 +169,22 @@ class AIPlayer:
         state_snapshot = self.model.get_raw_state()
         self.saved_states.append(state_snapshot)
         
-        logits, value = self.model(x=None) 
+        # CTDE Collection (Play Phase)
+        global_state = info.get('global_state', None)
+        sq_label = info.get('sq_label', 4)
+        void_label = info.get('void_label', [0.0]*16)
+        
+        if global_state is not None:
+            self.saved_global_states.append(global_state)
+            # Forward pass with global state
+            logits, value, _, _ = self.model(x=None, global_state=global_state.unsqueeze(0))
+        else:
+            self.saved_global_states.append(torch.zeros(208, device=self.device))
+            logits, value, _, _ = self.model(x=None, global_state=None)
+
+        self.saved_sq_labels.append(torch.tensor(sq_label, device=self.device))
+        self.saved_void_labels.append(torch.tensor(void_label, device=self.device, dtype=torch.float32))
+        
         logits = logits.squeeze()
         if logits.dim() > 1: logits = logits.squeeze(0)
         
@@ -176,7 +226,10 @@ class AIPlayer:
                 action_to_play = student_card
 
         self.saved_log_probs.append(dist.log_prob(torch.tensor(action_to_play.to_id(), device=self.device)).detach())
-        self.saved_values.append(value.detach())
+        if value is not None:
+            self.saved_values.append(value.detach())
+        else:
+            self.saved_values.append(torch.tensor(0.0, device=self.device))
         self.saved_actions.append(action_to_save) 
         
         return action_to_play

@@ -216,7 +216,28 @@ class HeartsTransformer(nn.Module):
         self.main_encoder = nn.TransformerEncoder(main_layer, num_layers=num_layers)
         
         self.output_head = nn.Linear(d_model, 52)
-        self.value_head = nn.Linear(d_model, 1)
+        
+        # --- CTDE & Aux Heads ---
+        # Global Encoder for Critic (4 players * 52 cards = 208)
+        self.global_encoder = nn.Sequential(
+            nn.Linear(208, 512),
+            nn.ReLU(),
+            nn.Linear(512, d_model),
+            nn.ReLU()
+        )
+        
+        # Value Head now takes [Actor_Features; Global_Features]
+        self.value_head = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.ReLU(),
+            nn.Linear(d_model, 1)
+        )
+        
+        # Aux 1: Predict SQ Location (5 classes: 0-3 players, 4=played/unknown)
+        self.aux_sq_head = nn.Linear(d_model, 5)
+        
+        # Aux 2: Predict Void Suits (4 players * 4 suits = 16 binary labels)
+        self.aux_void_head = nn.Linear(d_model, 16)
 
     def update_from_info(self, info, legal_actions, passed_cards=[], received_cards=[]):
         # info dict contains: 'game_state', 'rounds', 'pass_direction', 'my_id'
@@ -305,7 +326,7 @@ class HeartsTransformer(nn.Module):
         
         return final_embeddings, final_mask
 
-    def forward(self, x=None, padding_mask=None, batch_raw_states=None):
+    def forward(self, x=None, padding_mask=None, batch_raw_states=None, global_state=None):
         if x is None:
             if batch_raw_states is None:
                 # Single inference mode using internal state
@@ -377,7 +398,18 @@ class HeartsTransformer(nn.Module):
         pooled = output[:, 0, :] 
         
         logits = self.output_head(pooled)
-        value = self.value_head(pooled)
         
-        return logits, value
+        # --- CTDE Logic ---
+        value = None
+        if global_state is not None:
+            # Training mode: Use real global state
+            global_features = self.global_encoder(global_state)
+            critic_input = torch.cat([pooled, global_features], dim=1)
+            value = self.value_head(critic_input)
+
+        # --- Aux Heads ---
+        pred_sq = self.aux_sq_head(pooled)
+        pred_void = self.aux_void_head(pooled)
+        
+        return logits, value, pred_sq, pred_void
 

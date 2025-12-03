@@ -92,6 +92,28 @@ class GameV2:
             'current_order': len(self.gamestate.current_table)
         }
 
+    def get_training_labels(self):
+        # 1. SQ Location Label
+        # 0-3: Player ID, 4: Played/Unknown
+        sq_card = Card(Suit.SPADES, 12) # Queen
+        sq_label = 4
+        for i, p in enumerate(self.gamestate.players):
+            if sq_card in p.hand:
+                sq_label = i
+                break
+        
+        # 2. Void Label (4 players * 4 suits = 16)
+        # 1.0 = Void (No cards of that suit), 0.0 = Has cards
+        void_label = []
+        for p in self.gamestate.players:
+            has_suit = [False] * 4
+            for c in p.hand:
+                has_suit[c.suit.value] = True
+            is_void = [1.0 if not x else 0.0 for x in has_suit]
+            void_label.extend(is_void)
+            
+        return sq_label, void_label
+
     def get_player_info(self, player_id: int) -> Dict[str, Any]:
         p = self.gamestate.players[player_id]
         
@@ -106,6 +128,19 @@ class GameV2:
                 'points': pl.points,
                 'has_sq': has_sq
             })
+            
+        # --- CTDE: Generate Global State & Labels ---
+        # Only needed for training, but cheap to compute
+        import torch # Import inside method to avoid circular dependency if any
+        
+        sq_label, void_label = self.get_training_labels()
+        
+        # Global State Vector (4 * 52 = 208)
+        # 1.0 if player has card, else 0.0
+        global_state = torch.zeros(208)
+        for i, pl in enumerate(self.gamestate.players):
+            for card in pl.hand:
+                global_state[i*52 + card.to_id()] = 1.0
 
         return {
             'player_id': p.player_id,
@@ -124,7 +159,11 @@ class GameV2:
             'current_order': len(self.gamestate.current_table),
             'pass_direction': self.pass_direction,
             'trick_history': list(self.trick_history), # Added trick_history
-            'game_state': self.gamestate # Added game_state object for direct access if needed
+            'game_state': self.gamestate, # Added game_state object for direct access if needed
+            # CTDE Data
+            'global_state': global_state,
+            'sq_label': sq_label,
+            'void_label': void_label
         }
 
     def perform_pass(self, pass_direction: PassDirection, pass_policies: List[Callable]) -> List[PassEvent]:
