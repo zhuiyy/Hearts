@@ -17,17 +17,31 @@ def test_model(num_games=300):
 
     model = HeartsTransformer(d_model=config.HIDDEN_DIM, dropout=config.DROPOUT).to(device)
     
-    # Try to load best model first, then regular model, then pretrained
-    if os.path.exists(config.BEST_MODEL_PATH):
-        model_path = config.BEST_MODEL_PATH
-        print(f"Found Best Model: {model_path}")
-    elif os.path.exists(config.MODEL_PATH):
-        model_path = config.MODEL_PATH
-        print(f"Found Regular Model: {model_path}")
-    elif os.path.exists(config.PRETRAINED_MODEL_PATH):
-        model_path = config.PRETRAINED_MODEL_PATH
-        print(f"Found Pretrained Model: {model_path}")
+    # Ask user which model to test
+    print("Select model to test:")
+    print(f"1. Best Model ({config.BEST_MODEL_PATH})")
+    print(f"2. Latest RL Model ({config.MODEL_PATH})")
+    print(f"3. Pretrained Model ({config.PRETRAINED_MODEL_PATH})")
+    
+    choice = input("Enter choice (1/2/3, default 1): ").strip()
+    
+    model_path = None
+    if choice == '2':
+        if os.path.exists(config.MODEL_PATH):
+            model_path = config.MODEL_PATH
+    elif choice == '3':
+        if os.path.exists(config.PRETRAINED_MODEL_PATH):
+            model_path = config.PRETRAINED_MODEL_PATH
     else:
+        # Default to Best Model, or fallback
+        if os.path.exists(config.BEST_MODEL_PATH):
+            model_path = config.BEST_MODEL_PATH
+        elif os.path.exists(config.MODEL_PATH):
+            model_path = config.MODEL_PATH
+        elif os.path.exists(config.PRETRAINED_MODEL_PATH):
+            model_path = config.PRETRAINED_MODEL_PATH
+            
+    if model_path is None:
         print("Error: No model found in saved_models/")
         return
 
