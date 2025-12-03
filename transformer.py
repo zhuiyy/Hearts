@@ -246,7 +246,7 @@ class HeartsTransformer(nn.Module):
 
     def assemble_batch(self, batch_raw_states, device=None, dtype=torch.float32):
         if device is None:
-            device = next(self.parameters()).device
+            device = self.cls_token.device
             
         num_matrices = len(self.matrix)
         batched_sources = [[] for _ in range(num_matrices)]
