@@ -4,7 +4,9 @@ import random
 import uuid
 from flask import Flask, render_template, request, jsonify
 from game import GameV2, Card, Suit, PassDirection
-from train import AIPlayer, HeartsTransformer, HIDDEN_DIM, DROPOUT
+from transformer import HeartsTransformer
+from agent import AIPlayer
+import config
 from strategies import ExpertPolicy
 import gpu_selector
 
@@ -14,8 +16,8 @@ app = Flask(__name__)
 device = gpu_selector.select_device()
 print(f"Running on {device}")
 
-model = HeartsTransformer(d_model=HIDDEN_DIM, dropout=DROPOUT).to(device)
-model_path = 'hearts_model.pth'
+model = HeartsTransformer(d_model=config.HIDDEN_DIM, dropout=config.DROPOUT).to(device)
+model_path = config.MODEL_PATH
 
 if os.path.exists(model_path):
     print(f"Loading model from {model_path}...")

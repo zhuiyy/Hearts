@@ -5,7 +5,8 @@ import sys
 from game import GameV2
 from transformer import HeartsTransformer
 from data_structure import Card, PassDirection, Suit
-from train import AIPlayer, HIDDEN_DIM
+from agent import AIPlayer
+import config
 import strategies
 import gpu_selector
 
@@ -22,8 +23,8 @@ def run_showcase():
         
     print(f"Running on {device}")
     
-    model = HeartsTransformer(d_model=HIDDEN_DIM).to(device)
-    model_path = 'hearts_model.pth'
+    model = HeartsTransformer(d_model=config.HIDDEN_DIM).to(device)
+    model_path = config.MODEL_PATH
     
     if os.path.exists(model_path):
         print(f"Loading model from {model_path}...")
