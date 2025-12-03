@@ -353,7 +353,15 @@ class HeartsTransformer(nn.Module):
         x_history = x[:, history_start:history_end, :]
         mask_history = padding_mask[:, history_start:history_end]
         
-        x_history_encoded = self.history_encoder(x_history, src_key_padding_mask=mask_history)
+        # Handle all-masked history to prevent NaNs
+        all_masked = mask_history.all(dim=1)
+        
+        if all_masked.any():
+            mask_history_for_enc = mask_history.clone()
+            mask_history_for_enc[all_masked, 0] = False
+            x_history_encoded = self.history_encoder(x_history, src_key_padding_mask=mask_history_for_enc)
+        else:
+            x_history_encoded = self.history_encoder(x_history, src_key_padding_mask=mask_history)
         
         x_pre = x[:, :history_start, :]
         x_post = x[:, history_end:, :]
