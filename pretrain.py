@@ -39,6 +39,11 @@ def pretrain_supervised(model, device, log_data, episodes=1000, parallel_model=N
     batch_masks = []
     batch_returns = []
     
+    # CTDE Batches
+    batch_global_states = []
+    batch_sq_labels = []
+    batch_void_labels = []
+    
     beta = config.DAGGER_BETA_START
     beta_decay = config.DAGGER_BETA_DECAY
     min_beta = config.DAGGER_BETA_MIN
@@ -130,6 +135,10 @@ def pretrain_supervised(model, device, log_data, episodes=1000, parallel_model=N
             ai_player.saved_states = ai_player.saved_states[:min_len]
             ai_player.saved_actions = ai_player.saved_actions[:min_len]
             ai_player.saved_masks = ai_player.saved_masks[:min_len]
+            # CTDE Truncation
+            ai_player.saved_global_states = ai_player.saved_global_states[:min_len]
+            ai_player.saved_sq_labels = ai_player.saved_sq_labels[:min_len]
+            ai_player.saved_void_labels = ai_player.saved_void_labels[:min_len]
 
         R = 0
         returns = []
@@ -142,6 +151,11 @@ def pretrain_supervised(model, device, log_data, episodes=1000, parallel_model=N
         batch_masks.extend(ai_player.saved_masks)
         batch_returns.extend(returns)
         
+        # CTDE Extend
+        batch_global_states.extend(ai_player.saved_global_states)
+        batch_sq_labels.extend(ai_player.saved_sq_labels)
+        batch_void_labels.extend(ai_player.saved_void_labels)
+        
         if (i_episode + 1) % config.PRETRAIN_BATCH_SIZE == 0:
             b_returns = torch.tensor(batch_returns).to(device)
             if len(b_returns) > 1:
@@ -150,15 +164,27 @@ def pretrain_supervised(model, device, log_data, episodes=1000, parallel_model=N
             b_actions = torch.stack(batch_actions)
             masks = torch.stack(batch_masks)
             
+            # CTDE Stacking
+            b_global_states = torch.stack(batch_global_states)
+            b_sq_labels = torch.stack(batch_sq_labels)
+            b_void_labels = torch.stack(batch_void_labels)
+            
             for _ in range(config.PRETRAIN_EPOCHS):
                 # Use parallel_model here too
                 # x, padding_mask = model.assemble_batch(batch_states, device=device)
                 
-                logits, values = parallel_model(batch_raw_states=batch_states)
+                logits, values, pred_sq, pred_void = parallel_model(
+                    batch_raw_states=batch_states,
+                    global_state=b_global_states
+                )
                 logits = logits.squeeze()
                 values = values.squeeze()
                 
                 value_loss = torch.nn.functional.mse_loss(values, b_returns)
+                
+                # Aux Losses
+                loss_sq = torch.nn.functional.cross_entropy(pred_sq, b_sq_labels)
+                loss_void = torch.nn.functional.binary_cross_entropy_with_logits(pred_void, b_void_labels)
                 
                 masked_logits = logits + masks
                 
@@ -172,7 +198,7 @@ def pretrain_supervised(model, device, log_data, episodes=1000, parallel_model=N
                     pred_actions = torch.argmax(masked_logits, dim=1)
                     accuracy = (pred_actions == b_actions).float().mean()
                 
-                loss = policy_loss + config.VALUE_LOSS_COEF * value_loss
+                loss = policy_loss + config.VALUE_LOSS_COEF * value_loss + 0.5 * loss_sq + 0.5 * loss_void
                 
                 optimizer.zero_grad()
                 loss.backward()
@@ -195,6 +221,11 @@ def pretrain_supervised(model, device, log_data, episodes=1000, parallel_model=N
             batch_actions = []
             batch_masks = []
             batch_returns = []
+            
+            # CTDE Clear
+            batch_global_states = []
+            batch_sq_labels = []
+            batch_void_labels = []
         
         if (i_episode + 1) % config.PRETRAIN_BATCH_SIZE == 0:
              avg_loss = running_loss / config.PRETRAIN_EPOCHS

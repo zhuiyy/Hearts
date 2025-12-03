@@ -88,6 +88,7 @@ class AIPlayer:
             void_label = info.get('void_label', [0.0]*16)
             
             if global_state is not None:
+                global_state = global_state.to(self.device)
                 self.saved_global_states.append(global_state)
                 # Forward pass with global state (for Value Head)
                 logits, value, _, _ = self.model(x=None, global_state=global_state.unsqueeze(0))
@@ -175,6 +176,7 @@ class AIPlayer:
         void_label = info.get('void_label', [0.0]*16)
         
         if global_state is not None:
+            global_state = global_state.to(self.device)
             self.saved_global_states.append(global_state)
             # Forward pass with global state
             logits, value, _, _ = self.model(x=None, global_state=global_state.unsqueeze(0))
