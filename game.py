@@ -9,81 +9,43 @@ from data_structure import Suit, Card, Player, GameState, TrickRecord, PlayEvent
 
 
 def available_actions(player: Player, suit: Optional[Suit], is_first_round: bool, scored: bool) -> List[Card]:
-    """
-    Determine legal moves for a player.
-    
-    :param player: Current player
-    :param suit: Leading suit of the current trick (None if leading)
-    :param is_first_round: Whether this is the first trick of the game (2 of Clubs lead)
-    :param scored: Whether any points have been scored (hearts broken condition check usually, but here 'scored' implies points on table?)
-                   Actually in standard hearts, 'scored' usually refers to if hearts have been broken.
-                   Let's stick to the logic from the original file.
-    """
     hand = player.hand
     if is_first_round:
         if suit is None:
-            # Must lead 2 of Clubs if holding it (standard rule, usually enforced by game start)
-            # But if we are just checking general logic:
-            # In standard hearts, the player with 2C leads it.
-            # If this function is called for the leader of the first round, they MUST have 2C.
-            # If for some reason they don't (e.g. custom deal), we might need fallback.
-            # Assuming standard deal:
             c2 = Card(Suit.CLUBS, 2)
             if c2 in hand:
                 return [c2]
-            # If not holding 2C (shouldn't happen for leader), return all valid leads?
-            # Original code returned [2C] if suit is None.
             return [c2] 
         else:
-            # Following in first round
             suited = [c for c in hand if c.suit == suit]
             if suited:
                 return sorted(suited)
             
-            # Cannot play points (Hearts or QS) on first trick usually
-            # Original code: non_hearts = [c for c in hand if c.suit != Suit.HEARTS]
-            # And filter out QS (Spades 12)
             non_hearts = [c for c in hand if c.suit != Suit.HEARTS]
             safe_cards = [c for c in non_hearts if not (c.suit == Suit.SPADES and c.rank == 12)]
             
             if not scored and safe_cards:
                  return sorted(safe_cards)
             
-            # If only have point cards, must play them (slough)
             if not scored and non_hearts:
                  return sorted(non_hearts)
                  
             return sorted(hand)
     else:
         if suit is None:
-            # Leading
-            if not scored: # "scored" here seems to map to "hearts broken" in original logic context?
-                # Original logic: if not scored, cannot lead Hearts
+            if not scored: 
                 non_hearts = [c for c in hand if c.suit != Suit.HEARTS]
                 if non_hearts:
                     return sorted(non_hearts)
                 else:
-                    # Only have hearts, must lead hearts
                     return sorted(hand)
             else:
-                # Hearts broken, can lead anything
                 return sorted(hand)
         else:
-            # Following
             suited = [c for c in hand if c.suit == suit]
             if suited:
                 return sorted(suited)
             
-            # Sloughing
-            # Original logic:
-            # non_hearts = [c for c in hand if c.suit != Suit.HEARTS]
-            # if not scored and non_hearts: return sorted(non_hearts)
-            # return sorted(player.hand)
-            
-            # Wait, standard rules allow sloughing anything if void in suit.
-            # The restriction "if not scored" usually applies to breaking hearts?
-            # Or maybe "scored" means "points on table"?
-            # Let's stick to original logic to be safe.
             non_hearts = [c for c in hand if c.suit != Suit.HEARTS]
             if not scored and non_hearts:
                 return sorted(non_hearts)
@@ -108,17 +70,13 @@ class GameV2:
         self.pass_direction = PassDirection.KEEP
 
     def get_game_info(self) -> Dict[str, Any]:
-        # Construct a dictionary similar to original game_info
-        # But we can use the GameState's method if available or build it here
-        # Original game_info returned: rounds, players (snapshot), scoreboard, deck, history, current_table...
-        
         players_snapshot = []
         for p in self.gamestate.players:
             players_snapshot.append({
                 'player_id': p.player_id,
                 'hand': list(p.hand),
                 'points': p.points,
-                'taken_tricks': list(p.table) # p.table stores cards taken?
+                'taken_tricks': list(p.table)
             })
 
         return {
@@ -126,7 +84,7 @@ class GameV2:
             'players': players_snapshot,
             'scoreboard': [p.points for p in self.gamestate.players],
             'deck': list(self.gamestate.deck),
-            'history': list(self.gamestate.table), # All cards played in order?
+            'history': list(self.gamestate.table),
             'current_table': list(self.gamestate.current_table),
             'current_suit': self.gamestate.current_suit,
             'hearts_broken': self.gamestate.heart_broken,
@@ -135,10 +93,8 @@ class GameV2:
         }
 
     def get_player_info(self, player_id: int) -> Dict[str, Any]:
-        # Similar to original player_info
         p = self.gamestate.players[player_id]
         
-        # Gather public stats for all players
         players_stats = []
         for pl in self.gamestate.players:
             has_sq = False
@@ -153,11 +109,12 @@ class GameV2:
 
         return {
             'player_id': p.player_id,
+            'my_id': p.player_id, # Added alias for convenience
             'hand': list(p.hand),
             'points': p.points,
             'taken_tricks': list(p.table),
             'scoreboard': [pl.points for pl in self.gamestate.players],
-            'players_stats': players_stats, # New field
+            'players_stats': players_stats,
             'table': list(self.gamestate.table),
             'current_table': list(self.gamestate.current_table),
             'current_suit': self.gamestate.current_suit,
@@ -165,28 +122,20 @@ class GameV2:
             'piggy_pulled': self.gamestate.piggy_pulled,
             'rounds': self.rounds,
             'current_order': len(self.gamestate.current_table),
-            'pass_direction': self.pass_direction # New field
+            'pass_direction': self.pass_direction,
+            'trick_history': list(self.trick_history), # Added trick_history
+            'game_state': self.gamestate # Added game_state object for direct access if needed
         }
 
     def perform_pass(self, pass_direction: PassDirection, pass_policies: List[Callable]) -> List[PassEvent]:
-        """
-        Execute the passing phase.
-        
-        :param pass_direction: Direction to pass cards.
-        :param pass_policies: List of 4 policy functions for passing. 
-                              Signature: (player, player_info) -> List[Card] (3 cards)
-        :return: List of PassEvent
-        """
         if pass_direction == PassDirection.KEEP:
             return []
 
         pass_events = []
-        passed_cards_map = {} # player_id -> cards passed BY them
+        passed_cards_map = {} 
 
-        # 1. Select cards to pass
         for i, player in enumerate(self.gamestate.players):
             p_info = self.get_player_info(i)
-            # Policy should return 3 cards to pass
             cards_to_pass = pass_policies[i](player, p_info)
             
             if len(cards_to_pass) != 3:
@@ -199,27 +148,6 @@ class GameV2:
             
             passed_cards_map[i] = cards_to_pass
 
-        # 2. Distribute cards
-        for i in range(4):
-            target_idx = -1
-            if pass_direction == PassDirection.LEFT:
-                target_idx = (i + 1) % 4
-            elif pass_direction == PassDirection.RIGHT:
-                target_idx = (i - 1) % 4
-            elif pass_direction == PassDirection.ACROSS:
-                target_idx = (i + 2) % 4
-            
-            received_cards = passed_cards_map[target_idx] # Wait, if I am i, I receive from someone who passed TO me.
-            # Left (Clockwise): i passes to i+1. So i receives from i-1.
-            # Right (Counter-Clockwise): i passes to i-1. So i receives from i+1.
-            # Across: i passes to i+2. So i receives from i+2 (since +2 and -2 mod 4 are same).
-            
-            # Let's re-logic:
-            # We iterate over players who ARE RECEIVING.
-            # Or iterate over players who ARE PASSING and put into target.
-            pass
-        
-        # Let's iterate over SENDERS to make it easier
         for sender_idx in range(4):
             target_idx = -1
             if pass_direction == PassDirection.LEFT:
@@ -232,17 +160,10 @@ class GameV2:
             cards = passed_cards_map[sender_idx]
             self.gamestate.players[target_idx].hand.extend(cards)
             
-            # We need to record what sender_idx passed and what they received.
-            # But we can't record received until everyone has passed.
-            # So we do this in two passes or just store it.
-            
-        # Sort hands after receiving
         for player in self.gamestate.players:
             player.hand.sort()
 
-        # Create events
         for i in range(4):
-            # Who sent to i?
             sender_to_i = -1
             if pass_direction == PassDirection.LEFT:
                 sender_to_i = (i - 1) % 4
@@ -265,14 +186,6 @@ class GameV2:
         return pass_events
 
     def play_trick(self, first_player_idx: int, policies: List[Callable], verbose: bool = False) -> Tuple[int, int, List[PlayEvent]]:
-        """
-        Play a single trick (one round of 4 cards).
-        
-        :param first_player_idx: Index of the player who leads.
-        :param policies: List of 4 policy functions.
-        :param verbose: Whether to print game state.
-        :return: (winner_idx, points_in_trick, events_log)
-        """
         self.gamestate.current_table = []
         self.gamestate.current_suit = None
         
@@ -284,13 +197,6 @@ class GameV2:
             for i, p in enumerate(self.gamestate.players):
                 print(f'Player {i} hand: {sorted(p.hand)}')
 
-        # Check if hearts broken or scored condition for available_actions
-        # Original code used 'scored' = any(p.points > 0)
-        # But usually available_actions checks 'heart_broken' state directly inside?
-        # Wait, original available_actions takes 'scored' param.
-        # And inside it uses 'scored' to decide if hearts can be played/led.
-        # In original code: scored = any(p.points > 0 for p in self.gamestate.players)
-        # This implies "points have been taken by someone".
         scored = any(p.points > 0 for p in self.gamestate.players)
 
         for i in range(4):
@@ -298,30 +204,23 @@ class GameV2:
             player = self.gamestate.players[current_player_idx]
             is_first_trick = (self.rounds == 1)
             
-            # Determine legal actions
             legal_moves = available_actions(player, self.gamestate.current_suit, is_first_trick, scored)
             
             if verbose:
                 print(f"Player {current_player_idx} legal moves: {legal_moves}")
 
-            # Get action from policy
-            # Policy signature: (player, player_info, legal_moves, order_in_trick) -> Card
-            # We need to construct player_info
             p_info = self.get_player_info(current_player_idx)
             selected_card = policies[current_player_idx](player, p_info, legal_moves, i)
             
-            # Validate action
             if selected_card not in legal_moves:
                 raise ValueError(f"Player {current_player_idx} played illegal card {selected_card}. Legal: {legal_moves}")
 
-            # Update State
             player.hand.remove(selected_card)
             
-            # Record Event
             event = PlayEvent(
                 player_id=current_player_idx,
                 card=selected_card,
-                round_number=self.rounds, # Using rounds as trick number
+                round_number=self.rounds,
                 trick_number=self.rounds,
                 is_lead=(i == 0),
                 current_table=list(self.gamestate.current_table),
@@ -331,7 +230,6 @@ class GameV2:
             )
             trick_events.append(event)
 
-            # Update Game Logic
             if not self.gamestate.piggy_pulled and (selected_card.suit == Suit.SPADES and selected_card.rank == 12):
                 self.gamestate.piggy_pulled = True
                 self.gamestate.heart_broken = True
@@ -339,16 +237,6 @@ class GameV2:
             if selected_card.suit == Suit.HEARTS and not self.gamestate.heart_broken:
                 self.gamestate.heart_broken = True
 
-            # Add to tables
-            # player.table.append(selected_card) # Wait, player.table usually stores taken cards? 
-            # In original code: player.table.append(card) -> This seems to be "cards played by player"?
-            # Let's check original code: 
-            # player.table.append(card)
-            # table.append((card, player_idx))
-            # self.gamestate.table.append((card, player_idx))
-            # self.gamestate.current_table.append((card, player_idx))
-            
-            # If player.table is "cards played by this player historically", then yes.
             player.table.append(selected_card) 
             
             self.gamestate.table.append((selected_card, current_player_idx))
@@ -361,29 +249,16 @@ class GameV2:
             if verbose:
                 print(f"Player {current_player_idx} plays {selected_card}")
 
-        # Determine Winner
         lead_suit_cards = [(c, pid) for c, pid in trick_cards if c.suit == self.gamestate.current_suit]
-        # Highest rank wins. Ace is 1? Wait, Card rank: 1-13.
-        # Original code: key=lambda x: (x[0].rank - 2) % 13
-        # If rank 1 (Ace), (1-2)%13 = -1%13 = 12 (Highest)
-        # If rank 13 (King), (13-2)%13 = 11
-        # If rank 2, (2-2)%13 = 0 (Lowest)
-        # So Ace is high.
         winner_card, winner_idx = max(lead_suit_cards, key=lambda x: (x[0].rank - 2) % 13)
         
-        # Calculate Points
         points = sum(card_value(c) for c, _ in trick_cards)
         
-        # Update Winner Stats
         self.gamestate.players[winner_idx].points += points
-        # In original code, winner also gets the cards added to their 'table'? 
-        # No, original code: player.table.append(card) happened during play.
-        # But wait, usually 'table' in Player struct might mean 'tricks taken'?
-        # Original code: player.table.append(card) happens when they PLAY the card.
-        # So player.table is history of played cards.
         
-        # Record Trick History
         record = TrickRecord(winner=winner_idx, score=points, lead_suit=self.gamestate.current_suit)
+        record.cards = trick_cards # Dynamically add cards to record
+        
         self.trick_history.append(record)
         
         if verbose:
@@ -392,19 +267,13 @@ class GameV2:
 
         return winner_idx, points, trick_events
 
-    def run_game_training(self, policies: List[Callable], pass_policies: Optional[List[Callable]] = None, pass_direction: PassDirection = PassDirection.KEEP) -> Tuple[List[int], List[int], List[Any], List[TrickRecord]]:
-        """
-        Run a full game for training purposes.
-        Returns final scores, raw scores, list of all events, and trick history.
-        """
+    def run_game_training(self, policies: List[Callable], pass_policies: Optional[List[Callable]] = None, pass_direction: PassDirection = PassDirection.KEEP):
         self.reset()
         all_events = []
 
-        # Passing Phase
         if pass_direction != PassDirection.KEEP:
-            self.pass_direction = pass_direction # Store it
+            self.pass_direction = pass_direction
             if pass_policies is None:
-                # Default random pass policy if none provided
                 def random_pass(p, info):
                     return random.sample(p.hand, 3)
                 pass_policies = [random_pass] * 4
@@ -425,12 +294,8 @@ class GameV2:
         return scores, raw_scores, all_events, self.trick_history
 
     def run_game_showcase(self, policies: List[Callable], pass_policies: Optional[List[Callable]] = None, pass_direction: PassDirection = PassDirection.KEEP) -> List[int]:
-        """
-        Run a full game with verbose output for demonstration.
-        """
         self.reset()
         
-        # Passing Phase
         if pass_direction != PassDirection.KEEP:
             print(f"--- Passing Phase ({pass_direction.name}) ---")
             if pass_policies is None:
@@ -455,12 +320,8 @@ class GameV2:
         return scores
 
     def end_game_scoring(self) -> List[int]:
-        """
-        Handle Shooting the Moon logic and return final scores.
-        """
         scores = [p.points for p in self.gamestate.players]
         if 26 in scores:
-            # Shooting the Moon
             new_scores = []
             for s in scores:
                 if s == 26:
@@ -471,7 +332,6 @@ class GameV2:
         return scores
 
 if __name__ == '__main__':
-    # Simple test
     def random_policy(player, info, actions, order):
         return random.choice(actions)
     
