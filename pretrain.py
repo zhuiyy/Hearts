@@ -13,6 +13,12 @@ import gpu_selector
 from agent import AIPlayer
 import config
 
+# Aux Task Coefficients for Pretraining
+# We use lower coefficients here than in PPO because the primary goal is Behavioral Cloning.
+# High aux coefficients can distract the shared encoder from learning the policy.
+AUX_SQ_COEF = 0.05
+AUX_VOID_COEF = 0.05
+
 def pretrain_supervised(model, device, log_data, episodes=1000, parallel_model=None):
     print("Starting Supervised Pretraining...")
     if parallel_model is None:
@@ -198,7 +204,8 @@ def pretrain_supervised(model, device, log_data, episodes=1000, parallel_model=N
                     pred_actions = torch.argmax(masked_logits, dim=1)
                     accuracy = (pred_actions == b_actions).float().mean()
                 
-                loss = policy_loss + config.VALUE_LOSS_COEF * value_loss + 0.5 * loss_sq + 0.5 * loss_void
+                # Reduced Aux coefficients for stability
+                loss = policy_loss + config.VALUE_LOSS_COEF * value_loss + AUX_SQ_COEF * loss_sq + AUX_VOID_COEF * loss_void
                 
                 optimizer.zero_grad()
                 loss.backward()
