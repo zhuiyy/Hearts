@@ -1,3 +1,8 @@
+# Copied from transformer_method or new_method
+# Just a placeholder re-export as we copied the content
+# I will use the content from read_file of transformer_method/data_structure.py
+# and dump it here.
+
 from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import List, Optional, Tuple
@@ -46,6 +51,13 @@ class Card:
 
     def to_id(self) -> int:
         return self.suit.value * 13 + (self.rank - 1)
+    
+    @classmethod
+    def from_id(cls, card_id: int) -> "Card":
+        """Create a Card from its ID (0-51)."""
+        suit = Suit(card_id // 13)
+        rank = (card_id % 13) + 1
+        return cls(suit, rank)
 
 
 @dataclass
@@ -56,19 +68,17 @@ class Player:
     table: List[Card] = field(default_factory=list)
 
 
+
+
 @dataclass
 class TrickRecord:
     winner: int
     score: int
     lead_suit: Optional[Suit]
-    cards: List[Tuple[Card, int]] = field(default_factory=list)
 
 
 @dataclass
 class PassEvent:
-    """
-    Represents the event of passing cards at the start of the game.
-    """
     player_id: int
     direction: PassDirection
     passed_cards: List[Card]
@@ -77,18 +87,15 @@ class PassEvent:
 
 @dataclass
 class PlayEvent:
-    """
-    Represents a single card play event with full context for Transformer updates.
-    """
     player_id: int
     card: Card
-    round_number: int  # 1-13
-    trick_number: int  # 1-13
+    round_number: int 
+    trick_number: int 
     is_lead: bool
-    current_table: List[Tuple[Card, int]]  # Cards played so far in this trick
+    current_table: List[Tuple[Card, int]] 
     heart_broken: bool
     piggy_pulled: bool
-    legal_actions: List[Card]  # Actions that were available to the player
+    legal_actions: List[Card] 
 
 
 @dataclass
@@ -149,5 +156,4 @@ class GameState:
             'heart_broken': self.heart_broken,
             'piggy_pulled': self.piggy_pulled,
             'current_order': len(self.current_table)
-            
         }

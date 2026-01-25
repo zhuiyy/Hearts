@@ -1,0 +1,53 @@
+import os
+
+# Configuration for Simple FCN Hearts AI
+
+# Model
+HIDDEN_DIM = 512
+# Old Input: 176
+# New Enhanced Input Feature Spec:
+# 1. Hand (52)
+# 2. Table Cards (Current Trick) (52)
+# 3. History (Played by Me) (52) - To know what I spent
+# 4. History (Played by Others) (52) - What is gone
+# 5. Scores (4)
+# 6. Current Trick Info (6): 
+#    - [Has Hearts?, Has SQ?, My Rank High?, Others Rank High?, Count, Is Lead?]
+# 7. Danger Cards Status (3): [SQ Out?, SK Out?, SA Out?]
+# 8. Suit Counts (My Hand) (4)
+# 9. Void Inference (Others) (4 players * 4 suits = 16) - Deduced history
+# 10. Passed Cards (52) - 我传出去的牌
+# 11. Received Cards (52) - 我收到的牌  
+# 12. Pass Direction (4) - 传牌方向 (LEFT/RIGHT/ACROSS/KEEP)
+# === 新增对手建模特征 ===
+# 13. Opponent Suit Counts Estimate (3 opponents * 4 suits = 12) - 估计对手各花色剩余牌数
+# 14. SQ Location Probability (4) - SQ在各玩家手中的概率
+# 15. Current Trick Winner Prediction (4) - 当前trick谁会赢
+# 16. Game Progress (1) - 第几轮/13
+# 17. Remaining Cards Per Suit (4) - 各花色剩余未出牌数
+# 18. Points at Risk (1) - 当前trick有多少分
+# Total: 349 + 12 + 4 + 4 + 1 + 4 + 1 = 375
+INPUT_DIM = 375
+DROPOUT = 0.1
+
+# Training
+LR = 1e-4  # Reduced for fine-tuning against strong opponent
+GAMMA = 0.99
+BATCH_SIZE = 128
+PPO_EPOCHS = 4
+ENTROPY_COEF = 0.03  # Slightly increased for exploration against fixed opponent
+CLIP_EPS = 0.2
+VALUE_COEF = 0.5  # Value loss coefficient
+AUX_COEF = 0.3  # Auxiliary task coefficient
+TOTAL_EPISODES = 200000  # More training needed against strong opponent
+
+# Paths
+OUTPUT_DIR = os.path.join(os.path.dirname(__file__), 'output')
+if not os.path.exists(OUTPUT_DIR):
+    os.makedirs(OUTPUT_DIR)
+
+MODEL_PATH = os.path.join(OUTPUT_DIR, "simple_fcn_model.pth")
+PRETRAINED_MODEL_PATH = os.path.join(OUTPUT_DIR, "simple_fcn_pretrained.pth")
+PASSING_MODEL_PATH = os.path.join(OUTPUT_DIR, "passing_model.pth")
+PASSING_PRETRAINED_PATH = os.path.join(OUTPUT_DIR, "passing_pretrained.pth")
+LOG_FILE = os.path.join(OUTPUT_DIR, "training_log.json")

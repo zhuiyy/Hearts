@@ -102,6 +102,15 @@ class ExpertPolicy:
         current_suit: Optional[Suit] = info['current_suit']
         piggy_pulled: bool = info.get('piggy_pulled', False)
         
+        # ========== 新增：换牌信息感知 ==========
+        received_cards = info.get('received_cards', [])
+        passed_cards = info.get('passed_cards', [])
+        
+        # 标记收到的危险牌
+        received_sq = any(c.suit == Suit.SPADES and c.rank == 12 for c in received_cards)
+        received_high_spades = [c for c in received_cards if c.suit == Suit.SPADES and c.rank in [1, 13]]
+        received_high_hearts = [c for c in received_cards if c.suit == Suit.HEARTS and (c.rank >= 10 or c.rank == 1)]
+        
         # Helper to identify cards
         my_spades = [c for c in legal_actions if c.suit == Suit.SPADES]
         has_sq = any(c.rank == 12 for c in my_spades)
@@ -148,6 +157,16 @@ class ExpertPolicy:
                 # Arching the Pig: If we have safe spades and no dangerous ones, lead high to force pig
                 if safe_spades and not dangerous_spades:
                     return max(safe_spades, key=get_card_strength)
+
+            # ========== 新增：优先甩掉收到的危险牌 ==========
+            # 如果收到了高红心，尝试通过领牌后被截胡来甩掉
+            if received_high_hearts:
+                # 找一个可以被别人赢走的花色领牌
+                for suit in [Suit.CLUBS, Suit.DIAMONDS]:
+                    suit_cards = [c for c in legal_actions if c.suit == suit]
+                    if suit_cards:
+                        # 领低牌，希望别人赢走，然后我们可以在之后甩红心
+                        return min(suit_cards, key=get_card_strength)
 
             # Standard Lead Logic
             safe_leads = [c for c in legal_actions if c.suit != Suit.SPADES and c.suit != Suit.HEARTS]
@@ -244,6 +263,22 @@ class ExpertPolicy:
                     # We should dump points to NON-threats.
                     # But we don't know who will win the trick yet (unless we are last).
                     pass
+
+                # ========== 新增：优先甩掉收到的危险牌 ==========
+                # 0.5. 如果收到了 Q♠，优先甩！
+                if received_sq:
+                    sq = next((c for c in legal_actions if c.suit == Suit.SPADES and c.rank == 12), None)
+                    if sq: return sq
+                
+                # 0.6. 如果收到了高♠ (K♠, A♠)，优先甩！
+                for rc in received_high_spades:
+                    if rc in legal_actions:
+                        return rc
+                
+                # 0.7. 如果收到了高红心，优先甩！
+                for rc in received_high_hearts:
+                    if rc in legal_actions:
+                        return rc
 
                 # 1. Dump SQ (S12) - Always priority #1
                 sq = next((c for c in legal_actions if c.suit == Suit.SPADES and c.rank == 12), None)
