@@ -10,6 +10,14 @@ def smooth(data, window=50):
         return data
     return np.convolve(data, np.ones(window)/window, mode='valid')
 
+
+def get_series(data, *names):
+    for name in names:
+        values = data.get(name, [])
+        if values:
+            return values
+    return []
+
 def plot_training_results():
     log_file = config.LOG_FILE
     
@@ -22,10 +30,12 @@ def plot_training_results():
 
     episodes = data['episodes']
     scores = data['scores']
-    rewards = data.get('rewards', [])
-    losses = data.get('losses', [])
-    value_losses = data.get('value_losses', [])
-    entropies = data.get('entropies', [])
+    rewards = get_series(data, 'rewards')
+    losses = get_series(data, 'losses', 'play_losses')
+    value_losses = get_series(data, 'value_losses', 'play_value_losses')
+    entropies = get_series(data, 'entropies', 'play_entropies')
+    clip_fractions = get_series(data, 'clip_fractions', 'play_clip_fractions')
+    explained_variance = get_series(data, 'explained_variance', 'play_explained_variance')
 
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     fig.suptitle('Hearts AI Training Progress', fontsize=14, fontweight='bold')
@@ -75,7 +85,7 @@ def plot_training_results():
     else:
         ax3.text(0.5, 0.5, 'No Reward Data', ha='center', va='center', transform=ax3.transAxes)
 
-    # 4. Entropy (Should decrease as policy becomes more certain)
+    # 4. Entropy and PPO diagnostics
     ax4 = axes[1, 1]
     if entropies:
         ax4.plot(episodes, entropies, alpha=0.3, color='purple', label='Raw')
@@ -84,11 +94,22 @@ def plot_training_results():
             ax4.plot(episodes[49:], smoothed, color='purple', linewidth=2, label='Smoothed')
         ax4.set_xlabel('Episodes')
         ax4.set_ylabel('Entropy')
-        ax4.set_title('Policy Entropy (Decreasing = More Confident)')
+        ax4.set_title('Policy Entropy and PPO Diagnostics')
         ax4.legend(loc='upper right')
         ax4.grid(True, alpha=0.3)
     else:
         ax4.text(0.5, 0.5, 'No Entropy Data', ha='center', va='center', transform=ax4.transAxes)
+
+    if clip_fractions:
+        ax4b = ax4.twinx()
+        ax4b.plot(episodes, clip_fractions, alpha=0.4, color='red', label='Clip Fraction')
+        ax4b.set_ylabel('Clip Fraction')
+        ax4b.legend(loc='lower right')
+
+    if explained_variance:
+        print(f"Latest explained variance: {explained_variance[-1]:.3f}")
+    if losses:
+        print(f"Latest total loss: {losses[-1]:.3f}")
 
     plt.tight_layout()
     save_path = os.path.join(config.OUTPUT_DIR, 'training_plot.png')

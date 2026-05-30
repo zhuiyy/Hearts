@@ -44,9 +44,11 @@ def pad_sequences(batch):
     max_len = max(s.size(0) for s in state_seqs)
     max_len = max(max_len, 1)  # At least 1
     
+    lengths = []
     padded_seqs = []
     for seq in state_seqs:
         L = seq.size(0)
+        lengths.append(L)
         if L < max_len:
             padding = torch.zeros(max_len - L, config.INPUT_DIM)
             padded = torch.cat([seq, padding], dim=0)
@@ -58,8 +60,9 @@ def pad_sequences(batch):
     batch_masks = torch.stack(masks)  # [B, 52]
     batch_actions = torch.tensor(action_ids, dtype=torch.long)  # [B]
     batch_global = torch.stack(global_privs)  # [B, 156]
+    batch_lengths = torch.tensor(lengths, dtype=torch.long)
     
-    return batch_seqs, batch_masks, batch_actions, batch_global
+    return batch_seqs, batch_masks, batch_actions, batch_global, batch_lengths
 
 
 def collect_expert_data(num_games=5000, use_dagger=False, model=None, agent=None, beta=0.5):
@@ -87,6 +90,7 @@ def collect_expert_data(num_games=5000, use_dagger=False, model=None, agent=None
     
     for game_idx in tqdm(range(num_games)):
         pass_dir = random.choice([PassDirection.LEFT, PassDirection.RIGHT, PassDirection.ACROSS, PassDirection.KEEP])
+        agent_rollout = use_dagger and random.random() > beta
         
         # We'll collect data for player 0 using expert policy
         episode_history = []
@@ -118,7 +122,7 @@ def collect_expert_data(num_games=5000, use_dagger=False, model=None, agent=None
             data.append((seq.clone(), mask.clone(), action_id, global_priv.clone()))
             
             # DAgger: Sometimes let the agent play to explore its own mistakes
-            if use_dagger and random.random() > beta:
+            if agent_rollout:
                 # Agent plays (but expert action is still the label)
                 return agent.act(player, info, legal, order, training=False)
             else:
@@ -137,6 +141,7 @@ def collect_expert_data(num_games=5000, use_dagger=False, model=None, agent=None
         
         # Reset episode history for new game
         episode_history = []
+        agent.reset_episode_memory()
         
         game.run_game_training(policies, pass_policies, pass_dir)
     
@@ -203,14 +208,15 @@ def pretrain(num_games=5000, epochs=20, batch_size=256, lr=1e-3, dagger_rounds=3
             total = 0
         
             pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{round_epochs}")
-            for batch_seqs, batch_masks, batch_actions, batch_global in pbar:
+            for batch_seqs, batch_masks, batch_actions, batch_global, batch_lengths in pbar:
                 batch_seqs = batch_seqs.to(device)
                 batch_masks = batch_masks.to(device)
                 batch_actions = batch_actions.to(device)
                 batch_global = batch_global.to(device)
+                batch_lengths = batch_lengths.to(device)
                 
                 # Forward
-                logits, _, _, _ = model(batch_seqs, batch_global, hidden=None)
+                logits, _, _, _ = model(batch_seqs, batch_global, hidden=None, lengths=batch_lengths)
                 
                 # Apply mask
                 masked_logits = logits + batch_masks

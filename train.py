@@ -283,6 +283,7 @@ def update_ppo(agent, optimizer, episode_step_counts):
 
     # Stack sequences: [DatasetSize, SeqLen, Dim]
     max_len = 14
+    lengths = []
     padded_seqs = []
     
     for seq in agent.saved_state_seqs:
@@ -290,6 +291,7 @@ def update_ppo(agent, optimizer, episode_step_counts):
              seq = seq.to(agent.device)
 
         L = seq.size(1)
+        lengths.append(min(L, max_len))
         if L < max_len:
             pad_size = max_len - L
             padding = torch.zeros((1, pad_size, config.INPUT_DIM), device=agent.device)
@@ -301,6 +303,7 @@ def update_ppo(agent, optimizer, episode_step_counts):
             padded_seqs.append(seq)
             
     b_states = torch.cat(padded_seqs, dim=0)
+    b_lengths = torch.tensor(lengths, dtype=torch.long, device=agent.device)
 
     b_global_priv = torch.stack(agent.saved_global_priv)
     b_masks = torch.stack(agent.saved_masks)
@@ -343,7 +346,7 @@ def update_ppo(agent, optimizer, episode_step_counts):
         # Full batch update
         # We pass hidden=None so LSTM starts fresh, which is an approximation 
         # but acceptable since we provide full history sequence in b_states.
-        logits, values, qs_pred, _ = agent.model(b_states, b_global_priv)
+        logits, values, qs_pred, _ = agent.model(b_states, b_global_priv, lengths=b_lengths)
         values = values.squeeze()
         
         masked_logits = logits + b_masks

@@ -1,0 +1,16 @@
+---
+description: Hearts AI project context and lightweight training strategy
+alwaysApply: true
+---
+
+# Hearts AI Training Strategy
+
+- Before doing any Hearts AI training, evaluation, or algorithm changes, first read `.cursor/hearts-ai-training-handoff.md` and use it as the current handoff baseline.
+- This project trains a Hearts AI with `GameV2`, `HeartsLSTM`, `PassingNetwork`, DAgger pretraining, and PPO fine-tuning.
+- Prefer sample-efficient fixes over larger models. On this machine, improve evaluation, data quality, reward design, opponent curriculum, and rule-assisted policies before increasing model size.
+- Treat rulebased/Expert opponents as the first serious benchmark. Do not claim progress from training loss alone; report avg score, win rate or rank, and fixed-seed evaluation against Expert and Random.
+- When improving training, first inspect `train_joint.py`, `pretrain_joint.py`, `agent.py`, `model.py`, `passing_model.py`, `strategies.py`, and `config.py`.
+- Keep pass and play rewards aligned around final relative score/rank, while preserving useful trick-level penalties for credit assignment.
+- Prefer DAgger, expert disagreement sampling, snapshot opponent pools, and small league curricula before pure PPO against a strong fixed opponent.
+- Use `conda activate research` for Python verification in this repo.
+- Existing checkpoints may be incompatible with the current 375-dim `HeartsLSTM`; verify checkpoint loading before interpreting eval results.

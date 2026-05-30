@@ -62,7 +62,7 @@ class HeartsLSTM(nn.Module):
             nn.Linear(128, 52 * 3)  # 预测3个对手的出牌概率
         )
 
-    def forward(self, state_seq, global_priv_info=None, hidden=None):
+    def forward(self, state_seq, global_priv_info=None, hidden=None, lengths=None):
         """
         state_seq: [Batch, SeqLen, InputDim]
         hidden: (h_0, c_0) for LSTM
@@ -77,9 +77,14 @@ class HeartsLSTM(nn.Module):
         # out: [B, S, H], hidden: ([L, B, H], [L, B, H])
         lstm_out, new_hidden = self.lstm(x, hidden)
         
-        # Take the last step output for prediction
-        # [B, H]
-        last_out = lstm_out[:, -1, :]
+        # Take the last real timestep. Batched training pads sequences, while
+        # rollout/inference passes unpadded prefixes.
+        if lengths is None:
+            last_out = lstm_out[:, -1, :]
+        else:
+            lengths = lengths.to(state_seq.device).clamp(min=1, max=seq_len)
+            batch_idx = torch.arange(batch_size, device=state_seq.device)
+            last_out = lstm_out[batch_idx, lengths - 1, :]
         
         # Policy
         logits = self.policy_head(last_out)

@@ -68,9 +68,11 @@ def pad_sequences(batch):
     max_len = max(s.size(0) for s in state_seqs)
     max_len = max(max_len, 1)
     
+    lengths = []
     padded_seqs = []
     for seq in state_seqs:
         L = seq.size(0)
+        lengths.append(L)
         if L < max_len:
             padding = torch.zeros(max_len - L, config.INPUT_DIM)
             padded = torch.cat([seq, padding], dim=0)
@@ -82,8 +84,9 @@ def pad_sequences(batch):
     batch_masks = torch.stack(masks)
     batch_actions = torch.tensor(action_ids, dtype=torch.long)
     batch_global = torch.stack(global_privs)
+    batch_lengths = torch.tensor(lengths, dtype=torch.long)
     
-    return batch_seqs, batch_masks, batch_actions, batch_global
+    return batch_seqs, batch_masks, batch_actions, batch_global, batch_lengths
 
 
 def collect_joint_data(num_games, play_model, pass_model, play_agent, pass_agent, device, beta=0.5):
@@ -112,6 +115,7 @@ def collect_joint_data(num_games, play_model, pass_model, play_agent, pass_agent
     for game_idx in tqdm(range(num_games)):
         # Random pass direction (skip KEEP for passing training)
         pass_dir = random.choice([PassDirection.LEFT, PassDirection.RIGHT, PassDirection.ACROSS])
+        agent_rollout = random.random() >= beta
         
         # Reset episode memory
         play_agent.reset_episode_memory()
@@ -153,10 +157,7 @@ def collect_joint_data(num_games, play_model, pass_model, play_agent, pass_agent
             
             # For player 0, decide whether AI or Expert actually plays
             if player_id == 0:
-                if random.random() < beta:
-                    # Expert plays
-                    actual_cards = expert_cards
-                else:
+                if agent_rollout:
                     # AI plays
                     pass_model.eval()
                     with torch.no_grad():
@@ -166,6 +167,9 @@ def collect_joint_data(num_games, play_model, pass_model, play_agent, pass_agent
                         selected, _, _ = pass_model.select_three_cards(h, p, m, deterministic=False)
                         card_ids = selected[0].cpu().numpy()
                         actual_cards = [Card.from_id(int(idx)) for idx in card_ids]
+                else:
+                    # Expert plays
+                    actual_cards = expert_cards
                 
                 # Store passing data for player 0
                 pass_data.append((hand_vec, pass_dir_vec, hand_mask, expert_ids))
@@ -243,11 +247,11 @@ def collect_joint_data(num_games, play_model, pass_model, play_agent, pass_agent
                     play_data.append((seq.clone(), mask.clone(), action_id, global_priv.clone()))
                     
                     # Decide who actually plays
-                    if random.random() < beta:
-                        chosen_card = expert_action
-                    else:
+                    if agent_rollout:
                         # AI plays
                         chosen_card = play_agent.act(player, info, legal, i, training=False)
+                    else:
+                        chosen_card = expert_action
                 else:
                     # Other players use Expert
                     chosen_card = expert_action
@@ -318,9 +322,9 @@ def compute_pass_loss(model, hand_vec, pass_dir_vec, hand_mask, expert_cards, de
     return total_loss / 3, correct / (3 * batch_size)
 
 
-def compute_play_loss(model, batch_seqs, batch_masks, batch_actions, batch_global, device):
+def compute_play_loss(model, batch_seqs, batch_masks, batch_actions, batch_global, batch_lengths, device):
     """Compute cross-entropy loss for playing."""
-    logits, _, _, _ = model(batch_seqs, batch_global)
+    logits, _, _, _ = model(batch_seqs, batch_global, lengths=batch_lengths)
     
     # Apply mask and compute loss
     masked_logits = logits + batch_masks
@@ -361,6 +365,7 @@ def pretrain_joint(num_games=5000, epochs=15, batch_size=256, lr=1e-3, dagger_ro
     
     best_play_acc = 0
     best_pass_acc = 0
+    best_eval_score = float('inf')
     
     for dagger_round in range(dagger_rounds + 1):
         # Compute beta (probability of using Expert)
@@ -447,14 +452,15 @@ def pretrain_joint(num_games=5000, epochs=15, batch_size=256, lr=1e-3, dagger_ro
             play_correct = 0
             play_total = 0
             
-            for batch_seqs, batch_masks, batch_actions, batch_global in play_loader:
+            for batch_seqs, batch_masks, batch_actions, batch_global, batch_lengths in play_loader:
                 batch_seqs = batch_seqs.to(device)
                 batch_masks = batch_masks.to(device)
                 batch_actions = batch_actions.to(device)
                 batch_global = batch_global.to(device)
+                batch_lengths = batch_lengths.to(device)
                 
                 loss, acc = compute_play_loss(
-                    play_model, batch_seqs, batch_masks, batch_actions, batch_global, device
+                    play_model, batch_seqs, batch_masks, batch_actions, batch_global, batch_lengths, device
                 )
                 
                 play_optimizer.zero_grad()
@@ -472,33 +478,39 @@ def pretrain_joint(num_games=5000, epochs=15, batch_size=256, lr=1e-3, dagger_ro
             print(f"Epoch {epoch+1}/{round_epochs} | "
                   f"Pass Acc: {pass_acc:.4f} | Play Acc: {play_acc:.4f}")
             
-            # Save best models
-            if pass_acc > best_pass_acc:
-                best_pass_acc = pass_acc
-                torch.save({
-                    'model_state_dict': pass_model.state_dict(),
-                    'optimizer_state_dict': pass_optimizer.state_dict(),
-                    'accuracy': pass_acc,
-                    'dagger_round': dagger_round,
-                }, config.PASSING_PRETRAINED_PATH)
-            
-            if play_acc > best_play_acc:
-                best_play_acc = play_acc
-                torch.save({
-                    'model_state_dict': play_model.state_dict(),
-                    'optimizer_state_dict': play_optimizer.state_dict(),
-                    'accuracy': play_acc,
-                    'dagger_round': dagger_round,
-                }, config.PRETRAINED_MODEL_PATH)
+            best_pass_acc = max(best_pass_acc, pass_acc)
+            best_play_acc = max(best_play_acc, play_acc)
         
         # Quick evaluation
         print(f"\n--- Evaluation after Round {dagger_round} ---")
-        evaluate_joint(play_model, pass_model, device, num_games=100)
+        avg_expert, avg_random = evaluate_joint(play_model, pass_model, device, num_games=100)
+        if avg_expert < best_eval_score:
+            best_eval_score = avg_expert
+            torch.save({
+                'model_state_dict': play_model.state_dict(),
+                'optimizer_state_dict': play_optimizer.state_dict(),
+                'accuracy': play_acc,
+                'eval_vs_expert': avg_expert,
+                'eval_vs_random': avg_random,
+                'dagger_round': dagger_round,
+                'selection_metric': 'eval_vs_expert_avg_score',
+            }, config.PRETRAINED_MODEL_PATH)
+            torch.save({
+                'model_state_dict': pass_model.state_dict(),
+                'optimizer_state_dict': pass_optimizer.state_dict(),
+                'accuracy': pass_acc,
+                'eval_vs_expert': avg_expert,
+                'eval_vs_random': avg_random,
+                'dagger_round': dagger_round,
+                'selection_metric': 'eval_vs_expert_avg_score',
+            }, config.PASSING_PRETRAINED_PATH)
+            print(f"  -> Saved eval-best models (vs Expert={avg_expert:.2f}, vs Random={avg_random:.2f})")
     
     print(f"\n{'='*60}")
     print(f"Pre-training Complete!")
     print(f"Best Pass Accuracy: {best_pass_acc:.4f}")
     print(f"Best Play Accuracy: {best_play_acc:.4f}")
+    print(f"Best Eval vs Expert: {best_eval_score:.2f}")
     print(f"Models saved to: {config.OUTPUT_DIR}")
     print(f"{'='*60}")
 

@@ -130,8 +130,8 @@ class PassingNetwork(nn.Module):
                 card_idx = dist.sample()
             
             # Compute log prob
-            log_prob = F.log_softmax(logits.clamp(min=-100, max=100), dim=-1)
-            selected_log_prob = log_prob.gather(1, card_idx.unsqueeze(1)).squeeze(1)
+            selected_prob = probs.gather(1, card_idx.unsqueeze(1)).squeeze(1)
+            selected_log_prob = torch.log(selected_prob.clamp(min=1e-8))
             
             # Store results
             selected_cards.append(card_idx)
@@ -175,16 +175,14 @@ class PassingNetwork(nn.Module):
         
         for step in range(3):
             logits, value = self.forward(hand_vec, selected_vec, pass_dir_vec, current_mask)
-            
-            probs = F.softmax(logits, dim=-1)
-            log_prob = F.log_softmax(logits, dim=-1)
+            dist = torch.distributions.Categorical(logits=logits)
             
             # Get log prob of the action taken
             action = actions[:, step]
-            selected_log_prob = log_prob.gather(1, action.unsqueeze(1)).squeeze(1)
+            selected_log_prob = dist.log_prob(action)
             
             # Entropy
-            entropy = -(probs * log_prob).sum(dim=-1)
+            entropy = dist.entropy()
             
             log_probs.append(selected_log_prob)
             values.append(value.squeeze(1))

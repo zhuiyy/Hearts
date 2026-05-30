@@ -60,7 +60,6 @@ HeartsLSTM:
 """
 
 import sys
-import os
 
 
 def print_usage():
@@ -112,36 +111,10 @@ def run_eval():
     print("="*60 + "\n")
     
     from train_joint import evaluate_joint
-    import torch
-    from model import HeartsLSTM
-    from passing_model import PassingNetwork
     import config
-    
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    play_model = HeartsLSTM(config.INPUT_DIM, config.HIDDEN_DIM).to(device)
-    pass_model = PassingNetwork(hidden_dim=256).to(device)
-    
-    # Try to load RL-trained models first, then pretrained
-    play_path = config.MODEL_PATH if os.path.exists(config.MODEL_PATH) else config.PRETRAINED_MODEL_PATH
-    pass_path = config.PASSING_MODEL_PATH if os.path.exists(config.PASSING_MODEL_PATH) else config.PASSING_PRETRAINED_PATH
-    
-    if os.path.exists(play_path):
-        checkpoint = torch.load(play_path)
-        play_model.load_state_dict(checkpoint['model_state_dict'])
-        print(f"Loaded play model from {play_path}")
-    else:
-        print("No play model found!")
-    
-    if os.path.exists(pass_path):
-        checkpoint = torch.load(pass_path)
-        pass_model.load_state_dict(checkpoint['model_state_dict'])
-        print(f"Loaded pass model from {pass_path}")
-    else:
-        print("No pass model found!")
-    
+
     print("\n===== Evaluation Results =====")
-    evaluate_joint(play_model, pass_model, device, num_games=500)
+    evaluate_joint(num_games=config.EVAL_GAMES, seed=config.SEED)
 
 
 def main():

@@ -29,6 +29,7 @@ class SimpleFCNAgent: # Keeping the name to minimize refactor, but it's now LSTM
         self.saved_global_priv = []
         self.saved_masks = []
         self.saved_qs_labels = []
+        self.saved_expert_actions = []
         
         # LSTM Hidden State container for rollout
         self.current_hidden = None
@@ -45,6 +46,7 @@ class SimpleFCNAgent: # Keeping the name to minimize refactor, but it's now LSTM
         self.saved_global_priv = []
         self.saved_masks = []
         self.saved_qs_labels = []
+        self.saved_expert_actions = []
         
         self.episode_obs_history = []
         self.current_hidden = None
@@ -255,7 +257,7 @@ class SimpleFCNAgent: # Keeping the name to minimize refactor, but it's now LSTM
         # 11. SQ Location Probability (4维)
         # 追踪SQ在各玩家手中的概率
         sq_location = torch.zeros(4)
-        sq_card_id = 11 * 4 + 0  # Q♠ = rank 12 (index 11), suit 0
+        sq_card_id = Card(Suit.SPADES, 12).to_id()
         
         if sq_out > 0:
             # SQ已经打出，概率都是0
@@ -339,7 +341,7 @@ class SimpleFCNAgent: # Keeping the name to minimize refactor, but it's now LSTM
         """
         # If we have a passing agent, use it
         if hasattr(self, 'passing_agent') and self.passing_agent is not None:
-            return self.passing_agent.select_cards(player, info, deterministic=False)
+            return self.passing_agent.select_cards(player, info, deterministic=True)
         
         # Fallback to expert policy
         from strategies import ExpertPolicy
@@ -400,16 +402,13 @@ class SimpleFCNAgent: # Keeping the name to minimize refactor, but it's now LSTM
         else:
             probs = torch.softmax(masked_logits, dim=0)
         
-        # Epsilon Greedy Exploration
-        curr_actions = legal_indices
-        if training and random.random() < 0.05:
-            action_idx = torch.tensor(random.choice(curr_actions), device=self.device)
-        else:
-            dist = torch.distributions.Categorical(probs)
+        dist = torch.distributions.Categorical(probs)
+        if training:
             action_idx = dist.sample()
+        else:
+            action_idx = torch.argmax(probs)
         
         if training:
-            dist = torch.distributions.Categorical(probs)
             self.saved_log_probs.append(dist.log_prob(action_idx))
             
             if value is not None:
@@ -423,6 +422,9 @@ class SimpleFCNAgent: # Keeping the name to minimize refactor, but it's now LSTM
             self.saved_state_seqs.append(seq_tensor) 
             self.saved_masks.append(mask)
             self.saved_qs_labels.append(torch.tensor(info.get('sq_label', 4), device=self.device))
+            from strategies import ExpertPolicy
+            expert_card = ExpertPolicy.play_policy(player, info, legal_actions, order)
+            self.saved_expert_actions.append(torch.tensor(expert_card.to_id(), device=self.device))
             
             if global_priv_b is not None:
                 self.saved_global_priv.append(global_priv_b.squeeze())

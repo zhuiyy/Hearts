@@ -31,23 +31,40 @@ INPUT_DIM = 375
 DROPOUT = 0.1
 
 # Training
-LR = 1e-4  # Reduced for fine-tuning against strong opponent
+SEED = 42
+LR = 5e-5  # Conservative PPO fine-tuning from the pretrained policy
 GAMMA = 0.99
-BATCH_SIZE = 128
-PPO_EPOCHS = 4
-ENTROPY_COEF = 0.03  # Slightly increased for exploration against fixed opponent
-CLIP_EPS = 0.2
+GAE_LAMBDA = 0.95
+BATCH_SIZE = 512
+PPO_EPOCHS = 2
+ENTROPY_COEF = 0.005  # Keep exploration modest so PPO does not drift from Expert behavior
+CLIP_EPS = 0.1
 VALUE_COEF = 0.5  # Value loss coefficient
 AUX_COEF = 0.3  # Auxiliary task coefficient
-TOTAL_EPISODES = 200000  # More training needed against strong opponent
+BC_ANCHOR_COEF = 0.2  # Keep PPO close to Expert play actions during early fine-tuning
+PPO_TRAIN_PASSING = False
+PPO_USE_EXPERT_PASSING = True
+PPO_PROGRESS_INTERVAL = 25
+PPO_EVAL_INTERVAL = 2500
+TOTAL_EPISODES = 30000  # Controlled PPO run; stop/extend based on fixed-seed eval trend
+EVAL_GAMES = 200
+PPO_MAX_MINUTES = 150  # Hard wall-clock guard to avoid accidental all-day runs
+PPO_MAX_MINUTES = 60  # Hard wall-clock guard to avoid long stuck runs
+PPO_EARLY_STOP_PATIENCE_EVALS = 4  # Stop if N evals do not beat best
 
 # Paths
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), 'output')
 if not os.path.exists(OUTPUT_DIR):
     os.makedirs(OUTPUT_DIR)
 
+PPO_SNAPSHOT_DIR = os.path.join(OUTPUT_DIR, "ppo_snapshots")
+if not os.path.exists(PPO_SNAPSHOT_DIR):
+    os.makedirs(PPO_SNAPSHOT_DIR)
+
 MODEL_PATH = os.path.join(OUTPUT_DIR, "simple_fcn_model.pth")
 PRETRAINED_MODEL_PATH = os.path.join(OUTPUT_DIR, "simple_fcn_pretrained.pth")
+BEST_MODEL_PATH = os.path.join(OUTPUT_DIR, "simple_fcn_model_best.pth")
 PASSING_MODEL_PATH = os.path.join(OUTPUT_DIR, "passing_model.pth")
 PASSING_PRETRAINED_PATH = os.path.join(OUTPUT_DIR, "passing_pretrained.pth")
+PASSING_BEST_MODEL_PATH = os.path.join(OUTPUT_DIR, "passing_model_best.pth")
 LOG_FILE = os.path.join(OUTPUT_DIR, "training_log.json")
