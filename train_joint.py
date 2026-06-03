@@ -26,6 +26,7 @@ import json
 import os
 import sys
 import time
+import statistics
 from collections import deque
 from tqdm import tqdm
 import config
@@ -170,6 +171,32 @@ def load_checkpoint_eval_score(checkpoint_path):
     return eval_selection_score(checkpoint.get('eval'))
 
 
+def build_training_config_summary():
+    """Capture the PPO settings that most affect how to interpret a run."""
+    return {
+        'seed': config.SEED,
+        'eval_seeds': list(getattr(config, 'EVAL_SEEDS', [config.SEED])),
+        'eval_games_per_seed': getattr(config, 'EVAL_GAMES_PER_SEED', config.EVAL_GAMES),
+        'input_dim': config.INPUT_DIM,
+        'hidden_dim': config.HIDDEN_DIM,
+        'lr': config.LR,
+        'gamma': config.GAMMA,
+        'gae_lambda': config.GAE_LAMBDA,
+        'batch_size': config.BATCH_SIZE,
+        'ppo_epochs': config.PPO_EPOCHS,
+        'entropy_coef': config.ENTROPY_COEF,
+        'clip_eps': config.CLIP_EPS,
+        'value_coef': config.VALUE_COEF,
+        'aux_coef': config.AUX_COEF,
+        'bc_anchor_coef': config.BC_ANCHOR_COEF,
+        'ppo_train_passing': config.PPO_TRAIN_PASSING,
+        'ppo_use_expert_passing': config.PPO_USE_EXPERT_PASSING,
+        'ppo_eval_interval': config.PPO_EVAL_INTERVAL,
+        'ppo_max_minutes': config.PPO_MAX_MINUTES,
+        'ppo_early_stop_patience_evals': config.PPO_EARLY_STOP_PATIENCE_EVALS,
+    }
+
+
 def metric_slug(value):
     """Make a metric safe for filenames while preserving readable precision."""
     if value == float('inf'):
@@ -285,6 +312,75 @@ def print_eval_summary(label, summary):
     )
 
 
+def mean(values):
+    return sum(values) / len(values) if values else 0.0
+
+
+def stdev(values):
+    return statistics.stdev(values) if len(values) > 1 else 0.0
+
+
+def aggregate_seed_evals(seed_summaries):
+    """Aggregate independent seeded evals while preserving per-seed details."""
+    fields = [
+        'vs_expert_avg_score',
+        'vs_expert_avg_rank',
+        'vs_expert_win_rate',
+        'vs_expert_top2_rate',
+        'vs_random_avg_score',
+        'vs_random_avg_rank',
+        'vs_random_win_rate',
+        'vs_random_top2_rate',
+    ]
+    aggregate = {
+        'seed_results': seed_summaries,
+        'num_seeds': len(seed_summaries),
+        'num_games_per_seed': seed_summaries[0]['num_games'] if seed_summaries else 0,
+        'num_games': sum(summary['num_games'] for summary in seed_summaries),
+    }
+    for field in fields:
+        values = [summary[field] for summary in seed_summaries]
+        aggregate[field] = mean(values)
+        aggregate[f'{field}_std'] = stdev(values)
+    return aggregate
+
+
+def evaluate_across_seeds(
+    play_model=None,
+    pass_model=None,
+    device=None,
+    seeds=None,
+    games_per_seed=None,
+    use_expert_passing_for_player0=None,
+):
+    """Evaluate several independent deal streams so checkpoint selection is less seed-specific."""
+    seeds = list(seeds or getattr(config, 'EVAL_SEEDS', [config.SEED]))
+    games_per_seed = games_per_seed or getattr(config, 'EVAL_GAMES_PER_SEED', config.EVAL_GAMES)
+    seed_summaries = []
+    for seed in seeds:
+        print(f"\n===== Eval seed {seed} ({games_per_seed} games) =====")
+        summary = evaluate_joint(
+            play_model=play_model,
+            pass_model=pass_model,
+            device=device,
+            num_games=games_per_seed,
+            seed=seed,
+            use_expert_passing_for_player0=use_expert_passing_for_player0,
+        )
+        summary['seed'] = seed
+        seed_summaries.append(summary)
+
+    aggregate = aggregate_seed_evals(seed_summaries)
+    print(
+        "\n===== Multi-seed aggregate =====\n"
+        f"vs Expert Avg Score = {aggregate['vs_expert_avg_score']:.2f} "
+        f"+/- {aggregate['vs_expert_avg_score_std']:.2f} | "
+        f"vs Random Avg Score = {aggregate['vs_random_avg_score']:.2f} "
+        f"+/- {aggregate['vs_random_avg_score_std']:.2f}"
+    )
+    return aggregate
+
+
 def train_joint():
     """
     Joint training of PassingNetwork and HeartsLSTM using PPO.
@@ -335,6 +431,7 @@ def train_joint():
     
     # Logging
     log_data = {
+        'training_config': build_training_config_summary(),
         'episodes': [],
         'scores': [],
         'rewards': [],
@@ -357,6 +454,7 @@ def train_joint():
     episode_step_counts = []
     best_eval_score = load_checkpoint_eval_score(config.BEST_MODEL_PATH)
     next_eval_episode = config.PPO_EVAL_INTERVAL
+    evals_without_improvement = 0
     
     # Training parameters
     batch_size = config.BATCH_SIZE
@@ -367,6 +465,10 @@ def train_joint():
     stop_reason = "reached total episodes"
     print(f"\nStarting joint training for {total_episodes} episodes...")
     print(f"Batch size: {batch_size} games per update")
+    print(
+        f"Eval: {len(log_data['training_config']['eval_seeds'])} seeds x "
+        f"{log_data['training_config']['eval_games_per_seed']} games"
+    )
     print(
         "PPO mode: "
         f"{'play+pass' if config.PPO_TRAIN_PASSING else 'play-only'} | "
@@ -388,6 +490,7 @@ def train_joint():
         initial_eval,
         'pretrained_start',
     )
+    previous_best_eval_score = best_eval_score
     best_eval_score = save_best_if_improved(
         play_model,
         pass_model,
@@ -399,6 +502,8 @@ def train_joint():
         best_eval_score,
         'pretrained_start',
     )
+    if best_eval_score < previous_best_eval_score:
+        evals_without_improvement = 0
     print(f"  Starting best checkpoint: vs Expert Avg Score = {best_eval_score:.2f}")
     
     for episode in range(start_episode, total_episodes):
@@ -544,6 +649,7 @@ def train_joint():
                     eval_summary,
                     ppo_mode,
                 )
+                previous_best_eval_score = best_eval_score
                 best_eval_score = save_best_if_improved(
                     play_model,
                     pass_model,
@@ -555,6 +661,19 @@ def train_joint():
                     best_eval_score,
                     ppo_mode,
                 )
+                if best_eval_score < previous_best_eval_score:
+                    evals_without_improvement = 0
+                else:
+                    evals_without_improvement += 1
+
+                patience = getattr(config, "PPO_EARLY_STOP_PATIENCE_EVALS", None)
+                if patience and patience > 0 and evals_without_improvement >= patience:
+                    stop_reason = (
+                        f"no eval improvement for {evals_without_improvement} evals "
+                        f"(patience={patience})"
+                    )
+                    print(f"\nStopping early: {stop_reason}")
+                    break
         
         # Save periodically
         if (episode + 1) % 5000 == 0:
@@ -784,7 +903,7 @@ def save_models(
 
 
 def evaluate_for_training_checkpoint(play_model, pass_model, device):
-    """Run deterministic checkpoint eval without perturbing the training RNG stream."""
+    """Run checkpoint eval without perturbing the training RNG stream."""
     python_rng_state = random.getstate()
     torch_rng_state = torch.get_rng_state()
     cuda_rng_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
@@ -792,12 +911,12 @@ def evaluate_for_training_checkpoint(play_model, pass_model, device):
     pass_was_training = pass_model.training
 
     try:
-        return evaluate_joint(
+        return evaluate_across_seeds(
             play_model=play_model,
             pass_model=pass_model,
             device=device,
-            num_games=config.EVAL_GAMES,
-            seed=config.SEED,
+            seeds=getattr(config, 'EVAL_SEEDS', [config.SEED]),
+            games_per_seed=getattr(config, 'EVAL_GAMES_PER_SEED', config.EVAL_GAMES),
             use_expert_passing_for_player0=config.PPO_USE_EXPERT_PASSING,
         )
     finally:
@@ -911,6 +1030,6 @@ def evaluate_joint(
 if __name__ == "__main__":
     import sys
     if len(sys.argv) > 1 and sys.argv[1] == 'eval':
-        evaluate_joint(seed=config.SEED)
+        evaluate_across_seeds()
     else:
         train_joint()

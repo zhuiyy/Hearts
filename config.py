@@ -1,34 +1,33 @@
 import os
 
-# Configuration for Simple FCN Hearts AI
+# Configuration for Hearts AI
 
 # Model
 HIDDEN_DIM = 512
-# Old Input: 176
-# New Enhanced Input Feature Spec:
+DROPOUT = 0.1
+
+# Enhanced input feature spec:
 # 1. Hand (52)
-# 2. Table Cards (Current Trick) (52)
-# 3. History (Played by Me) (52) - To know what I spent
-# 4. History (Played by Others) (52) - What is gone
+# 2. Table Cards, current trick (52)
+# 3. History, played by me (52)
+# 4. History, played by others (52)
 # 5. Scores (4)
-# 6. Current Trick Info (6): 
-#    - [Has Hearts?, Has SQ?, My Rank High?, Others Rank High?, Count, Is Lead?]
+# 6. Current Trick Info (6):
+#    [Has Hearts?, Has SQ?, My Rank High?, Current Winner Strength, Count, Is Lead?]
 # 7. Danger Cards Status (3): [SQ Out?, SK Out?, SA Out?]
-# 8. Suit Counts (My Hand) (4)
-# 9. Void Inference (Others) (4 players * 4 suits = 16) - Deduced history
-# 10. Passed Cards (52) - 我传出去的牌
-# 11. Received Cards (52) - 我收到的牌  
-# 12. Pass Direction (4) - 传牌方向 (LEFT/RIGHT/ACROSS/KEEP)
-# === 新增对手建模特征 ===
-# 13. Opponent Suit Counts Estimate (3 opponents * 4 suits = 12) - 估计对手各花色剩余牌数
-# 14. SQ Location Probability (4) - SQ在各玩家手中的概率
-# 15. Current Trick Winner Prediction (4) - 当前trick谁会赢
-# 16. Game Progress (1) - 第几轮/13
-# 17. Remaining Cards Per Suit (4) - 各花色剩余未出牌数
-# 18. Points at Risk (1) - 当前trick有多少分
+# 8. Suit Counts, my hand (4)
+# 9. Void Inference, all players by suit (4 players * 4 suits = 16)
+# 10. Passed Cards (52)
+# 11. Received Cards (52)
+# 12. Pass Direction (4): LEFT/RIGHT/ACROSS/KEEP
+# 13. Opponent Suit Counts Estimate (3 opponents * 4 suits = 12)
+# 14. SQ Location Probability (4)
+# 15. Current Trick Winner Prediction (4)
+# 16. Game Progress (1)
+# 17. Remaining Cards Per Suit (4)
+# 18. Points at Risk (1)
 # Total: 349 + 12 + 4 + 4 + 1 + 4 + 1 = 375
 INPUT_DIM = 375
-DROPOUT = 0.1
 
 # Training
 SEED = 42
@@ -39,18 +38,24 @@ BATCH_SIZE = 512
 PPO_EPOCHS = 2
 ENTROPY_COEF = 0.005  # Keep exploration modest so PPO does not drift from Expert behavior
 CLIP_EPS = 0.1
-VALUE_COEF = 0.5  # Value loss coefficient
-AUX_COEF = 0.3  # Auxiliary task coefficient
+VALUE_COEF = 0.5
+AUX_COEF = 0.3
 BC_ANCHOR_COEF = 0.2  # Keep PPO close to Expert play actions during early fine-tuning
+
+# PPO mode. By default, PPO trains only the play network and uses Expert passing for player 0.
 PPO_TRAIN_PASSING = False
 PPO_USE_EXPERT_PASSING = True
+
 PPO_PROGRESS_INTERVAL = 25
 PPO_EVAL_INTERVAL = 2500
-TOTAL_EPISODES = 30000  # Controlled PPO run; stop/extend based on fixed-seed eval trend
+TOTAL_EPISODES = 30000
+PPO_MAX_MINUTES = 60
+PPO_EARLY_STOP_PATIENCE_EVALS = 4
+
+# Evaluation. Training checkpoint selection uses the multi-seed settings below.
 EVAL_GAMES = 200
-PPO_MAX_MINUTES = 150  # Hard wall-clock guard to avoid accidental all-day runs
-PPO_MAX_MINUTES = 60  # Hard wall-clock guard to avoid long stuck runs
-PPO_EARLY_STOP_PATIENCE_EVALS = 4  # Stop if N evals do not beat best
+EVAL_SEEDS = [SEED, SEED + 1, SEED + 2]
+EVAL_GAMES_PER_SEED = 100
 
 # Paths
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), 'output')
