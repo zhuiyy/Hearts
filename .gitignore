@@ -1,9 +1,10 @@
 __pycache__/
-*.pyc
-
-res/*
+*.py[cod]
+.venv/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+.DS_Store
 .env
-
-*.DS_Store
-*.json
-*.pth
+artifacts/

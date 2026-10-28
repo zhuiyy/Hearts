@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hearts-research"
+version = "0.1.0"
+description = "A reproducible, strategy-independent Hearts research platform"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+stats = ["scipy>=1.11,<2"]
+dev = ["ruff>=0.8,<1"]
+
+[project.scripts]
+hearts = "hearts.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["hearts*"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "RUF022"]
